@@ -1,0 +1,51 @@
+# arguments for dataset
+dataset: potsdam
+nclass: 6
+crop_size: 518
+data_root: Potsdam
+
+# arguments for training
+epochs: 50
+batch_size: 4 # per GPU x 4 GPUs
+lr: 0.000005
+lr_multi: 40.0
+criterion:
+  name: CELoss
+  kwargs:
+    ignore_index: 255
+conf_thresh: 0.95
+
+# arguments for model
+model: dpt
+backbone: dinov2_small
+lock_backbone: False
+
+use_vlm_pp: true
+vlm_type: qwen_vl
+vlm_pp_conf_threshold: 0.7
+use_vlm_on_mismatch: true
+
+# ==========================
+# CEE Edge-aware Module
+# ==========================
+# use_cee: False keeps the original SemiEarth baseline behaviour.
+use_cee: true
+# Edge-aware pseudo label selection at the unsupervised loss.
+use_edge_threshold: true
+# CEE-guided VLM purification (low-conf & edge targets + edge fusion boost).
+use_cee_vlm: true
+# Edge dilation window (1/0 = off, odd values recommended).
+edge_width: 3
+# Relaxed confidence threshold for semantic boundary pixels.
+edge_conf_thresh: 0.85
+# VLM influence multiplier on edge pixels during confidence fusion.
+edge_vlm_weight: 1.5
+# Reuse cached VLM spatial probs across iterations. Auto (unset): disabled in
+# CEE-guided mode, enabled for the baseline. Set explicitly to force it.
+# use_vlm_cache: false
+# Save 7-panel CEE debug figures to <save_path>/debug_cee once per epoch.
+save_cee_debug: false
+# Print per-iteration CEE-VLM diagnostic counters (edge/low-conf/target pixels).
+cee_debug: false
+# Skip VLM refinement when target pixels below this count (0 = always run).
+min_edge_pixels: 0
