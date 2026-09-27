@@ -1,11 +1,11 @@
 # arguments for dataset
-dataset: loveda
-nclass: 8
+dataset: potsdam
+nclass: 6
 crop_size: 518
-data_root: datasets/LoveDA
+data_root: Potsdam
 
 # arguments for training
-epochs: 20
+epochs: 50
 batch_size: 4 # per GPU x 4 GPUs
 lr: 0.000005
 lr_multi: 40.0
@@ -23,7 +23,6 @@ lock_backbone: False
 use_vlm_pp: true
 vlm_type: qwen_vl
 vlm_pp_conf_threshold: 0.7
-qwen_model_name: /home/a8/qhf/SemiEarth-master04/SemiEarth-master/pretrained/qwen2_5_vl_3b_instruct
 use_vlm_on_mismatch: true
 
 # ==========================
@@ -38,7 +37,7 @@ use_cee_vlm: true
 # Edge dilation window (1/0 = off, odd values recommended).
 edge_width: 3
 # Relaxed confidence threshold for semantic boundary pixels.
-edge_conf_thresh: 0.75
+edge_conf_thresh: 0.85
 # VLM influence multiplier on edge pixels during confidence fusion.
 edge_vlm_weight: 1.5
 # Reuse cached VLM spatial probs across iterations. Auto (unset): disabled in
@@ -50,31 +49,3 @@ save_cee_debug: false
 cee_debug: false
 # Skip VLM refinement when target pixels below this count (0 = always run).
 min_edge_pixels: 0
-
-# Training-only CTSA; keep every existing CEE option above unchanged.
-use_ctsa: true
-ctsa_dim: 128
-ctsa_heads: 4
-ctsa_alpha: 0.1
-ctsa_temperature: 0.1
-ctsa_weight: 0.1
-ctsa_warmup_ratio: 0.1
-ctsa_ramp_ratio: 0.1
-# none = basic CTSA; confidence = confidence gate; agreement = purified-label gate.
-ctsa_gate: agreement
-ctsa_gate_statistics: false
-ctsa_reject_corrected: true
-
-# Runtime optimizations (no changes to CEE thresholds, sampling or fusion).
-amp: true
-amp_dtype: auto
-teacher_amp: false
-eval_amp: false
-num_workers: 4
-val_num_workers: 2
-persistent_workers: true
-prefetch_factor: 2
-log_interval: 50
-profile_steps: 5
-qwen_batch_size: 2
-qwen_attention: sdpa

@@ -8,7 +8,6 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import math
 from dataset.semi import SemiDataset
-from util.training_runtime import load_segmentation_state
 
 try:
     from model.semseg.dpt import DPT
@@ -105,8 +104,13 @@ def test(args):
         else:
             new_state_dict[k] = v
 
-    load_segmentation_state(model, new_state_dict)
-    print('Loaded segmentation weights; training-only CTSA parameters excluded.')
+    try:
+        model.load_state_dict(new_state_dict, strict=True)
+        print("Successfully loaded model weights (strict=True).")
+    except Exception as e:
+        print(f"Strict load failed: {e}")
+        print("Trying strict=False...")
+        model.load_state_dict(new_state_dict, strict=False)
 
     model.cuda()
     model.eval()

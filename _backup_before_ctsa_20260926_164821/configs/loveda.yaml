@@ -50,31 +50,3 @@ save_cee_debug: false
 cee_debug: false
 # Skip VLM refinement when target pixels below this count (0 = always run).
 min_edge_pixels: 0
-
-# Training-only CTSA; keep every existing CEE option above unchanged.
-use_ctsa: true
-ctsa_dim: 128
-ctsa_heads: 4
-ctsa_alpha: 0.1
-ctsa_temperature: 0.1
-ctsa_weight: 0.1
-ctsa_warmup_ratio: 0.1
-ctsa_ramp_ratio: 0.1
-# none = basic CTSA; confidence = confidence gate; agreement = purified-label gate.
-ctsa_gate: agreement
-ctsa_gate_statistics: false
-ctsa_reject_corrected: true
-
-# Runtime optimizations (no changes to CEE thresholds, sampling or fusion).
-amp: true
-amp_dtype: auto
-teacher_amp: false
-eval_amp: false
-num_workers: 4
-val_num_workers: 2
-persistent_workers: true
-prefetch_factor: 2
-log_interval: 50
-profile_steps: 5
-qwen_batch_size: 2
-qwen_attention: sdpa

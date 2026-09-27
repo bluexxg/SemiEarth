@@ -1,74 +1,62 @@
-import argparse
 import torch
-import numpy as np
 import torch.distributed as dist
 import torch.nn.functional as F
-from util.utils import count_params, AverageMeter, intersectionAndUnion, init_log
+from util.training_runtime import intersection_union, autocast_settings
 
+
+@torch.no_grad()
 def evaluate(model, loader, mode, cfg, multiplier=None):
+    # Accumulate on the GPU; synchronize the small count array only once.
     model.eval()
-    assert mode in ['original', 'center_crop', 'sliding_window']
-    intersection_meter = AverageMeter()
-    union_meter = AverageMeter()
-
-    with torch.no_grad():
-        for img, mask, id in loader:
-            
-            img = img.cuda()
-                
+    model = model.module if hasattr(model, 'module') else model
+    device = next(model.parameters()).device
+    assert mode in ('original', 'sliding_window')
+    counts = torch.zeros(2, cfg['nclass'], dtype=torch.int64, device=device)
+    enabled, dtype = autocast_settings(cfg)
+    enabled = enabled and cfg.get('eval_amp', False) and device.type == 'cuda'
+    for img, mask, _ in loader:
+        img = img.to(device, non_blocking=True)
+        mask = mask.to(device, non_blocking=True)
+        ori_h, ori_w = img.shape[-2:]
+        with torch.autocast(device_type=device.type, enabled=enabled, dtype=dtype):
             if mode == 'sliding_window':
                 grid = cfg['crop_size']
                 b, _, h, w = img.shape
-                final = torch.zeros(b, 19, h, w).cuda()
-                
+                final = torch.zeros(b, cfg['nclass'], h, w, device=device)
                 row = 0
-                while row < h:
+                while True:
                     col = 0
-                    while col < w:
-                        pred = model(img[:, :, row: row + grid, col: col + grid])
-                        final[:, :, row: row + grid, col: col + grid] += pred.softmax(dim=1)
-                        if col == w - grid:
+                    while True:
+                        tile = img[:, :, row:row + grid, col:col + grid]
+                        th, tw = tile.shape[-2:]
+                        if multiplier:
+                            tile = F.interpolate(tile, (max(multiplier, round(th / multiplier) * multiplier),
+                                                       max(multiplier, round(tw / multiplier) * multiplier)),
+                                                 mode='bilinear', align_corners=True)
+                        output = model(tile)
+                        output = F.interpolate(output.float(), (th, tw), mode='bilinear', align_corners=True)
+                        final[:, :, row:row + th, col:col + tw] += output.softmax(1)
+                        if col >= max(w - grid, 0):
                             break
-                        col = min(col + int(grid * 2 / 3), w - grid)
-                    if row == h - grid:
+                        col = min(col + max(1, int(grid * 2 / 3)), max(w - grid, 0))
+                    if row >= max(h - grid, 0):
                         break
-                    row = min(row + int(grid * 2 / 3), h - grid)
-                    
-                pred = final
-            
+                    row = min(row + max(1, int(grid * 2 / 3)), max(h - grid, 0))
+                logits = final
             else:
-                assert mode == 'original'
-                
                 if multiplier is not None:
-                    ori_h, ori_w = img.shape[-2:]
-                    if multiplier == 512:
-                        new_h, new_w = 512, 512
-                    else:
-                        new_h, new_w = int(ori_h / multiplier + 0.5) * multiplier, int(ori_w / multiplier + 0.5) * multiplier
-                    img = F.interpolate(img, (new_h, new_w), mode='bilinear', align_corners=True)
-                
-                pred = model(img)
-            
+                    size = ((512, 512) if multiplier == 512 else
+                            (max(multiplier, int(ori_h / multiplier + .5) * multiplier),
+                             max(multiplier, int(ori_w / multiplier + .5) * multiplier)))
+                    img = F.interpolate(img, size, mode='bilinear', align_corners=True)
+                logits = model(img)
                 if multiplier is not None:
-                    pred = F.interpolate(pred, (ori_h, ori_w), mode='bilinear', align_corners=True)
-            
-            pred = pred.argmax(dim=1)
-
-            intersection, union, target = \
-                intersectionAndUnion(pred.cpu().numpy(), mask.numpy(), cfg['nclass'], 255)
-
-            reduced_intersection = torch.from_numpy(intersection).cuda()
-            reduced_union = torch.from_numpy(union).cuda()
-            reduced_target = torch.from_numpy(target).cuda()
-
-            dist.all_reduce(reduced_intersection)
-            dist.all_reduce(reduced_union)
-            dist.all_reduce(reduced_target)
-
-            intersection_meter.update(reduced_intersection.cpu().numpy())
-            union_meter.update(reduced_union.cpu().numpy())
-
-    iou_class = intersection_meter.sum / (union_meter.sum + 1e-10) * 100.0
-    mIOU = np.mean(iou_class)
-
-    return mIOU, iou_class
+                    logits = F.interpolate(logits, (ori_h, ori_w), mode='bilinear', align_corners=True)
+        intersection, union = intersection_union(logits.argmax(1), mask, cfg['nclass'])
+        counts[0] += intersection
+        counts[1] += union
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(counts)
+    values = counts.cpu().numpy()
+    iou = values[0] / (values[1] + 1e-10) * 100.0
+    return iou.mean(), iou

@@ -1,0 +1,1649 @@
+--- a/semiearth.py
++++ b/semiearth.py
+@@ -3,6 +3,7 @@
+ import logging
+ import os
+ import pprint
++import time
+ 
+ import torch
+ from torch import nn
+@@ -14,13 +15,15 @@
+ 
+ from dataset.semi import SemiDataset
+ from model.semseg.dpt import DPT
+-from model.semseg.vlm_pp import QwenVLPurifiedSemi
+ from evaluation import evaluate
+ from util.classes import CLASSES
+ from util.ohem import ProbOhemCrossEntropy2d
+ from util.utils import count_params, init_log, AverageMeter
+ from util.dist_helper import setup_distributed
+ from util.cee import extract_multi_class_edge, save_cee_debug
++from util.ctsa import prepare_ctsa, cutmix_tensor, auxiliary_loss, ctsa_weight
++from util.training_runtime import (autocast_settings, loader_options, update_ema,
++                                   load_segmentation_state, StepTimer)
+ 
+ parser = argparse.ArgumentParser(
+     description='Vision-Language Model Purified Semi-Supervised Semantic Segmentation for Remote Sensing Images')
+@@ -30,13 +33,15 @@
+ parser.add_argument('--save-path', type=str, required=True)
+ parser.add_argument('--local_rank', '--local-rank', default=0, type=int)
+ parser.add_argument('--port', default=None, type=int)
++parser.add_argument('--init-checkpoint', default=None, help='Initialize weights only; use a NEW save directory')
+ 
+ def get_vlm_purify(cfg, model, model_ema):
+     vlm_type = cfg.get('vlm_type')
+     class_names = CLASSES[cfg['dataset']]
+ 
+     if vlm_type == 'qwen_vl':
+-        return QwenVLPurifiedSemi(cfg, model, model_ema, class_names)
++        from model.semseg.vlm_runtime import BatchedQwenVLPurifiedSemi
++        return BatchedQwenVLPurifiedSemi(cfg, model, model_ema, class_names)
+     elif vlm_type == 'none':
+         return None
+     else:
+@@ -73,6 +78,12 @@
+ 
+     cudnn.enabled = True
+     cudnn.benchmark = True
++    use_ctsa = bool(cfg.get('use_ctsa', False))
++    amp_enabled, amp_dtype = autocast_settings(cfg)
++    scaler = torch.amp.GradScaler('cuda', enabled=amp_enabled and amp_dtype == torch.float16)
++    if rank == 0:
++        logger.info('CTSA=%s, student AMP=%s/%s; CEE selection/fusion unchanged',
++                    use_ctsa, amp_enabled, amp_dtype)
+ 
+     model_configs = {
+         'small': {'encoder_size': 'small', 'features': 64, 'out_channels': [48, 96, 192, 384]},
+@@ -80,9 +91,10 @@
+         'large': {'encoder_size': 'large', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
+         'giant': {'encoder_size': 'giant', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]}
+     }
+-    model = DPT(**{**model_configs[cfg['backbone'].split('_')[-1]], 'nclass': cfg['nclass']})
+-
+-    state_dict = torch.load(f'./pretrained/{cfg["backbone"]}.pth')
++    model = DPT(**{**model_configs[cfg['backbone'].split('_')[-1]],
++                   'nclass': cfg['nclass'], 'ctsa_config': cfg})
++
++    state_dict = torch.load(f'./pretrained/{cfg["backbone"]}.pth', map_location='cpu', weights_only=True)
+     model.backbone.load_state_dict(state_dict)
+ 
+     if cfg['lock_backbone']:
+@@ -102,26 +114,6 @@
+         logger.info('Encoder params: {:.1f}M'.format(count_params(model.backbone)))
+         logger.info('Decoder params: {:.1f}M\n'.format(count_params(model.head)))
+ 
+-        try:
+-            from thop import profile as thop_profile, clever_format
+-            import copy
+-            _patch = 14
+-            _sz = cfg['crop_size'] if isinstance(cfg['crop_size'], int) else cfg['crop_size'][0]
+-            _sz = (_sz // _patch) * _patch
+-            _dummy = torch.randn(1, 3, _sz, _sz)
+-            _model_copy = copy.deepcopy(model)
+-            _macs, _ = thop_profile(_model_copy, inputs=(_dummy,), verbose=False)
+-            del _model_copy, _dummy
+-            _gflops_infer = _macs * 2 / 1e9
+-            _gflops_train = _gflops_infer * 3
+-            _macs_str, _ = clever_format([_macs, 0], '%.3f')
+-            logger.info(f'[Efficiency] Input size for FLOPs: {_sz}×{_sz}')
+-            logger.info(f'[Efficiency] MACs          : {_macs_str}')
+-            logger.info(f'[Efficiency] Inference FLOPs: {_gflops_infer:.2f} GFLOPs')
+-            logger.info(f'[Efficiency] Training FLOPs : {_gflops_train:.2f} GFLOPs (≈3× inference)\n')
+-        except ImportError:
+-            logger.warning('[Efficiency] thop 未安装，跳过 FLOPs 测量 (pip install thop)')
+-
+     local_rank = int(os.environ["LOCAL_RANK"])
+     model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+     model.cuda()
+@@ -129,6 +121,12 @@
+     model = torch.nn.parallel.DistributedDataParallel(
+         model, device_ids=[local_rank], broadcast_buffers=False, output_device=local_rank, find_unused_parameters=True
+     )
++    model_ema = deepcopy(model.module)
++    model_ema.ctsa = None  # teacher is the deployment network, without auxiliary parameters
++    model_ema.eval()
++    for param in model_ema.parameters():
++        param.requires_grad = False
++
+     if rank == 0 and cfg.get('profile_model', False):
+         from profile_model import measure_flops, measure_fps
+         _H, _W = cfg['crop_size'] if isinstance(cfg['crop_size'], (list, tuple)) \
+@@ -142,10 +140,6 @@
+                     device=torch.device('cuda'), logger=logger)
+         model.train()
+ 
+-    model_ema = deepcopy(model)
+-    model_ema.eval()
+-    for param in model_ema.parameters():
+-        param.requires_grad = False
+ 
+     if cfg['criterion']['name'] == 'CELoss':
+         criterion_l = nn.CrossEntropyLoss(**cfg['criterion']['kwargs']).cuda(local_rank)
+@@ -157,7 +151,8 @@
+     criterion_u = nn.CrossEntropyLoss(reduction='none').cuda(local_rank)
+ 
+     trainset_u = SemiDataset(
+-        cfg['dataset'], cfg['data_root'], 'train_u', cfg['crop_size'], args.unlabeled_id_path
++        cfg['dataset'], cfg['data_root'], 'train_u', cfg['crop_size'], args.unlabeled_id_path,
++        single_strong=True
+     )
+     trainset_l = SemiDataset(
+         cfg['dataset'], cfg['data_root'], 'train_l', cfg['crop_size'], args.labeled_id_path, nsample=len(trainset_u.ids)
+@@ -168,28 +163,45 @@
+ 
+     trainsampler_l = torch.utils.data.distributed.DistributedSampler(trainset_l)
+     trainloader_l = DataLoader(
+-        trainset_l, batch_size=cfg['batch_size'], pin_memory=True, num_workers=4, drop_last=True, sampler=trainsampler_l
++        trainset_l, batch_size=cfg['batch_size'], drop_last=True, sampler=trainsampler_l, **loader_options(cfg)
+     )
+ 
+     trainsampler_u = torch.utils.data.distributed.DistributedSampler(trainset_u)
+     trainloader_u = DataLoader(
+-        trainset_u, batch_size=cfg['batch_size'], pin_memory=True, num_workers=4, drop_last=True, sampler=trainsampler_u
++        trainset_u, batch_size=cfg['batch_size'], drop_last=True, sampler=trainsampler_u, **loader_options(cfg)
+     )
+ 
+     valsampler = torch.utils.data.distributed.DistributedSampler(valset)
+     valloader = DataLoader(
+-        valset, batch_size=1, pin_memory=True, num_workers=1, drop_last=False, sampler=valsampler
+-    )
+-
++        valset, batch_size=1, drop_last=False, sampler=valsampler, **loader_options(cfg, validation=True)
++    )
++
++    if not len(trainloader_u) or len(trainloader_l) != len(trainloader_u):
++        raise ValueError('Need nonempty, equally long labeled/unlabeled loaders; check split and batch size')
+     total_iters = len(trainloader_u) * cfg['epochs']
+     previous_best, previous_best_ema = 0.0, 0.0
+     best_epoch, best_epoch_ema = 0, 0
+     epoch = -1
+ 
+-    if os.path.exists(os.path.join(args.save_path, 'latest.pth')):
+-        checkpoint = torch.load(os.path.join(args.save_path, 'latest.pth'), weights_only=False)
+-        model.load_state_dict(checkpoint['model'])
+-        model_ema.load_state_dict(checkpoint['model_ema'])
++    latest_path = os.path.join(args.save_path, 'latest.pth')
++    if args.init_checkpoint and os.path.exists(latest_path):
++        raise ValueError('--init-checkpoint requires a new save directory')
++    if args.init_checkpoint:
++        initial = torch.load(args.init_checkpoint, map_location='cpu', weights_only=False)
++        load_segmentation_state(model, initial.get('model', initial), allow_missing_ctsa=True)
++        load_segmentation_state(model_ema, initial.get('model_ema', initial.get('model', initial)))
++        if rank == 0:
++            logger.info('Initialized weights from %s; optimizer and schedule start fresh', args.init_checkpoint)
++
++    if os.path.exists(latest_path):
++        checkpoint = torch.load(latest_path, map_location='cpu', weights_only=False)
++        has_ctsa = any(k.removeprefix('module.').startswith('ctsa.') for k in checkpoint['model'])
++        if has_ctsa != use_ctsa:
++            raise ValueError('CTSA configuration differs from checkpoint. Use --init-checkpoint and a NEW save path.')
++        load_segmentation_state(model, checkpoint['model'])
++        load_segmentation_state(model_ema, checkpoint['model_ema'])
++        if 'scaler' in checkpoint:
++            scaler.load_state_dict(checkpoint['scaler'])
+         optimizer.load_state_dict(checkpoint['optimizer'])
+         epoch = checkpoint['epoch']
+         previous_best = checkpoint['previous_best']
+@@ -213,6 +225,8 @@
+         total_loss = AverageMeter()
+         total_loss_x = AverageMeter()
+         total_loss_s = AverageMeter()
++        total_loss_ctsa = AverageMeter()
++        total_gate_ratio = AverageMeter()
+         total_mask_ratio = AverageMeter()
+         total_throughput = AverageMeter()
+         cee_edge_ratio = AverageMeter()
+@@ -227,21 +241,32 @@
+         loader = zip(trainloader_l, trainloader_u)
+ 
+         model.train()
++        epoch_start = time.perf_counter()
++        log_every = max(1, int(cfg.get('log_interval', max(1, len(trainloader_u) // 8))))
+ 
+         for i, ((img_x, mask_x),
+-                (img_u_w, img_u_s, _, ignore_mask, cutmix_box, _)) in enumerate(loader):
+-            _iter_start = torch.cuda.Event(enable_timing=True)
+-            _iter_end = torch.cuda.Event(enable_timing=True)
+-            _iter_start.record()
+-
+-            img_x, mask_x = img_x.cuda(), mask_x.cuda()
+-            img_u_w, img_u_s = img_u_w.cuda(), img_u_s.cuda()
+-            ignore_mask, cutmix_box = ignore_mask.cuda(), cutmix_box.cuda()
++                (img_u_w, img_u_s, ignore_mask, cutmix_box)) in enumerate(loader):
++            iters = epoch * len(trainloader_u) + i
++            timer = StepTimer(i < int(cfg.get('profile_steps', 0)) and epoch == 0)
++            ct_weight = ctsa_weight(iters, total_iters, cfg) if use_ctsa else 0.0
++            # Same decision on every rank. During warmup skip the entire auxiliary
++            # path (DDP find_unused_parameters=True); no rank-specific skipping.
++            run_ctsa = use_ctsa and ct_weight > 0
++
++            img_x, mask_x = img_x.cuda(non_blocking=True), mask_x.cuda(non_blocking=True)
++            img_u_w, img_u_s = img_u_w.cuda(non_blocking=True), img_u_s.cuda(non_blocking=True)
++            ignore_mask, cutmix_box = ignore_mask.cuda(non_blocking=True), cutmix_box.cuda(non_blocking=True)
+ 
+             with torch.no_grad():
+-                pred_u_w = model_ema(img_u_w).detach()
+-                conf_u_w = pred_u_w.softmax(dim=1).max(dim=1)[0]
+-                mask_u_w = pred_u_w.argmax(dim=1)
++                with torch.autocast('cuda', enabled=amp_enabled and cfg.get('teacher_amp', False), dtype=amp_dtype):
++                    teacher_output = model_ema(img_u_w, return_last_feature=run_ctsa)
++                if run_ctsa:
++                    pred_u_w, teacher_last = teacher_output
++                else:
++                    pred_u_w = teacher_output
++                conf_u_w, mask_u_w = pred_u_w.float().softmax(dim=1).max(dim=1)
++                raw_teacher_labels = mask_u_w.clone() if run_ctsa else None
++                timer.mark('teacher_ms')
+                 # CEE: multi-class semantic edge map from teacher pseudo labels.
+                 # Pure tensor op, zero params, inside no_grad -> negligible cost.
+                 edge_map = extract_multi_class_edge(mask_u_w, edge_width=edge_width) if use_cee else None
+@@ -251,21 +276,21 @@
+                 # IDENTICAL to the priority_mask used inside get_qwen_purify.
+                 if use_cee and edge_map is not None:
+                     valid = (ignore_mask != 255)
+-                    total_valid = valid.sum().item()
++                    total_valid = valid.sum()
+                     _edge = edge_map & valid
+-                    cee_edge_ratio.update(_edge.sum().item() / max(total_valid, 1))
++                    cee_edge_ratio.update(_edge.sum() / total_valid.clamp_min(1))
+                     _reliable = _edge & (conf_u_w >= edge_conf_thresh)
+-                    cee_reliable_edge_ratio.update(_reliable.sum().item() / max(total_valid, 1))
++                    cee_reliable_edge_ratio.update(_reliable.sum() / total_valid.clamp_min(1))
+                     _low_conf_edge = _edge & (conf_u_w < edge_conf_thresh)
+-                    cee_low_conf_edge_ratio.update(_low_conf_edge.sum().item() / max(total_valid, 1))
++                    cee_low_conf_edge_ratio.update(_low_conf_edge.sum() / total_valid.clamp_min(1))
+                     if cee_debug and (_reliable & _low_conf_edge).sum() != 0:
+                         logger.warning('[CEE ERROR] reliable & low-conf edge overlap: threshold direction bug')
+                     # VLM target == low-conf & edge, the SAME tensor the VLM
+                     # uses as its priority_mask (conf < vlm_pp_conf_threshold).
+                     _vlm_target = edge_map & (conf_u_w < vlm_pp_conf_threshold)
+-                    vlm_target_pixels = _vlm_target.sum().item()
++                    vlm_target_pixels = _vlm_target.sum()
+                     cee_vlm_target_pixels.update(vlm_target_pixels)
+-                    cee_vlm_target_ratio.update(vlm_target_pixels / max(total_valid, 1))
++                    cee_vlm_target_ratio.update(vlm_target_pixels / total_valid.clamp_min(1))
+                 else:
+                     vlm_target_pixels = 0
+ 
+@@ -281,11 +306,10 @@
+                         else:
+                             conf_u_w = vlm_purify.get_qwen_purify(
+                                 img_u_w, mask_u_w, conf_u_w, edge_map=edge_map)
+-            img_u_s[cutmix_box.unsqueeze(1).expand(img_u_s.shape) == 1] = img_u_s.flip(0)[
+-                cutmix_box.unsqueeze(1).expand(img_u_s.shape) == 1]
++            timer.mark('vlm_ms')
++            img_u_s = cutmix_tensor(img_u_s, cutmix_box)
+ 
+             num_lb, num_ulb = img_x.shape[0], img_u_s.shape[0]
+-            pred_x, pred_u_s = model(torch.cat((img_x, img_u_s))).split([num_lb, num_ulb])
+ 
+             mask_u_w_cutmixed, conf_u_w_cutmixed, ignore_mask_cutmixed = mask_u_w.clone(), conf_u_w.clone(), ignore_mask.clone()
+             edge_map_cutmixed = edge_map.clone() if edge_map is not None else None
+@@ -296,9 +320,6 @@
+             if edge_map_cutmixed is not None:
+                 edge_map_cutmixed[cutmix_box == 1] = edge_map.flip(0)[cutmix_box == 1]
+ 
+-            loss_x = criterion_l(pred_x, mask_x)
+-
+-            loss_u_s = criterion_u(pred_u_s, mask_u_w_cutmixed)
+             # Edge-aware pseudo label selection: interior pixels keep the
+             # original conf_thresh, boundary pixels use the relaxed
+             # edge_conf_thresh. Disabled -> exactly the original filter.
+@@ -307,50 +328,71 @@
+                 conf_mask = conf_mask | (edge_map_cutmixed & (conf_u_w_cutmixed >= edge_conf_thresh))
+             else:
+                 conf_mask = conf_u_w_cutmixed >= cfg['conf_thresh']
+-            loss_u_s = loss_u_s * (conf_mask & (ignore_mask_cutmixed != 255))
+-            loss_u_s = loss_u_s.sum() / (ignore_mask_cutmixed != 255).sum().item()
+-
+-            loss = (loss_x + loss_u_s) / 2.0
+-
+-            torch.distributed.barrier()
+-
+-            optimizer.zero_grad()
+-            loss.backward()
+-            optimizer.step()
+-
+-            total_loss.update(loss.item())
+-            total_loss_x.update(loss_x.item())
+-            total_loss_s.update(loss_u_s.item())
++            accepted = conf_mask & (ignore_mask_cutmixed != 255)
++            aux_logits = None
++            if run_ctsa:
++                raw_mixed = cutmix_tensor(raw_teacher_labels, cutmix_box)
++                teacher_last, gate, active = prepare_ctsa(
++                    teacher_last, raw_mixed, mask_u_w_cutmixed, conf_u_w_cutmixed,
++                    accepted, cutmix_box, (img_u_s.shape[-2] // 14, img_u_s.shape[-1] // 14),
++                    mode=cfg.get('ctsa_gate', 'agreement'),
++                    reject_corrected=cfg.get('ctsa_reject_corrected', True))
++            with torch.autocast('cuda', enabled=amp_enabled, dtype=amp_dtype):
++                if run_ctsa:
++                    predictions, aux_logits = model(
++                        torch.cat((img_x, img_u_s)), teacher_feature=teacher_last,
++                        ctsa_gate=gate, num_labeled=num_lb)
++                else:
++                    predictions = model(torch.cat((img_x, img_u_s)))
++                pred_x, pred_u_s = predictions.split([num_lb, num_ulb])
++            loss_x = criterion_l(pred_x.float(), mask_x)
++            loss_u_s = criterion_u(pred_u_s.float(), mask_u_w_cutmixed)
++            loss_u_s = (loss_u_s * accepted).sum() / (ignore_mask_cutmixed != 255).sum().clamp_min(1)
++            loss_ctsa = (auxiliary_loss(aux_logits, mask_u_w_cutmixed, accepted,
++                                       ignore_mask_cutmixed, active) if run_ctsa else loss_u_s.new_zeros(()))
++            loss = (loss_x + loss_u_s) / 2.0 + ct_weight * loss_ctsa
++            timer.mark('student_forward_ms')
++            optimizer.zero_grad(set_to_none=True)
++            scaler.scale(loss).backward()
++            old_scale = scaler.get_scale()
++            scaler.step(optimizer)
++            scaler.update()
++            stepped = scaler.get_scale() >= old_scale
++            timer.mark('backward_optimizer_ms')
++
++            total_loss.update(loss.detach())
++            total_loss_x.update(loss_x.detach())
++            total_loss_s.update(loss_u_s.detach())
++            total_loss_ctsa.update(loss_ctsa.detach())
++            if run_ctsa:
++                total_gate_ratio.update((gate > 0).float().mean())
+             # mask ratio (edge-aware when CEE is on) + CEE stats for logging
+             if use_cee and use_edge_threshold and edge_map is not None:
+                 conf_mask_ratio = ((~edge_map) & (conf_u_w >= cfg['conf_thresh'])) | \
+                                   (edge_map & (conf_u_w >= edge_conf_thresh))
+-                mask_ratio = (conf_mask_ratio & (ignore_mask != 255)).sum().item() / (ignore_mask != 255).sum()
++                mask_ratio = (conf_mask_ratio & (ignore_mask != 255)).sum() / (ignore_mask != 255).sum().clamp_min(1)
+             else:
+-                mask_ratio = ((conf_u_w >= cfg['conf_thresh']) & (ignore_mask != 255)).sum().item() / (
+-                    ignore_mask != 255).sum()
+-            total_mask_ratio.update(mask_ratio.item())
+-
+-            _iter_end.record()
+-            torch.cuda.synchronize()
+-            _iter_ms = _iter_start.elapsed_time(_iter_end)  # ms/iter
+-            _imgs_iter = cfg['batch_size'] * world_size * 2  # labeled + unlabeled
+-            _throughput = _imgs_iter / (_iter_ms / 1000.0)  # images/s
+-            total_throughput.update(_throughput)
+-
+-            iters = epoch * len(trainloader_u) + i
++                mask_ratio = ((conf_u_w >= cfg['conf_thresh']) & (ignore_mask != 255)).sum() / (
++                    ignore_mask != 255).sum().clamp_min(1)
++            total_mask_ratio.update(mask_ratio.detach())
++
+             lr = cfg['lr'] * (1 - iters / total_iters) ** 0.9
+             optimizer.param_groups[0]["lr"] = lr
+             optimizer.param_groups[1]["lr"] = lr * cfg['lr_multi']
+ 
+             ema_ratio = min(1 - 1 / (iters + 1), 0.996)
+ 
+-            for param, param_ema in zip(model.parameters(), model_ema.parameters()):
+-                param_ema.copy_(param_ema * ema_ratio + param.detach() * (1 - ema_ratio))
+-            for buffer, buffer_ema in zip(model.buffers(), model_ema.buffers()):
+-                buffer_ema.copy_(buffer_ema * ema_ratio + buffer.detach() * (1 - ema_ratio))
+-
+-            if rank == 0:
++            if stepped:
++                update_ema(model, model_ema, ema_ratio)
++            timer.mark('ema_ms')
++            timings = timer.finish()
++            if timings and rank == 0:
++                logger.info('[Profile step %d] %s', iters, timings)
++
++            if rank == 0 and (i % log_every == 0 or i + 1 == len(trainloader_u)):
++                writer.add_scalar('train/loss_ctsa', loss_ctsa.detach().item(), iters)
++                writer.add_scalar('train/ctsa_weight', ct_weight, iters)
++                writer.add_scalar('train/ctsa_gate_ratio', total_gate_ratio.avg, iters)
+                 writer.add_scalar('train/loss_all', loss.item(), iters)
+                 writer.add_scalar('train/loss_x', loss_x.item(), iters)
+                 writer.add_scalar('train/loss_s', loss_u_s.item(), iters)
+@@ -361,7 +403,11 @@
+                     writer.add_scalar('train/cee_low_conf_edge_ratio', cee_low_conf_edge_ratio.val, iters)
+                     writer.add_scalar('train/cee_vlm_target_ratio', cee_vlm_target_ratio.val, iters)
+ 
+-            if (i % (len(trainloader_u) // 8) == 0) and (rank == 0):
++            if (i % log_every == 0 or i + 1 == len(trainloader_u)) and rank == 0:
++                elapsed = max(time.perf_counter() - epoch_start, 1e-6)
++                total_throughput.update((i + 1) * cfg['batch_size'] * world_size * 2 / elapsed)
++                logger.info('[CTSA] weight=%.4f loss=%.4f gate_coverage=%.4f',
++                            ct_weight, total_loss_ctsa.avg, total_gate_ratio.avg)
+                 logger.info(
+                     'Iters: {:}, LR: {:.7f}, Total loss: {:.3f}, Loss x: {:.3f}, '
+                     'Loss s: {:.3f}, Mask ratio: {:.3f}, Throughput: {:.1f} img/s'.format(
+@@ -398,10 +444,14 @@
+                     refined_labels=mask_u_w, nclass=cfg['nclass'],
+                 )
+ 
++        if rank == 0:
++            logger.info('[Timing] training epoch seconds: %.1f', time.perf_counter() - epoch_start)
++        validation_start = time.perf_counter()
+         eval_mode = 'sliding_window' if cfg['dataset'] == '-' else 'original'
+         mIoU, iou_class = evaluate(model, valloader, eval_mode, cfg, multiplier=14)
+         mIoU_ema, iou_class_ema = evaluate(model_ema, valloader, eval_mode, cfg, multiplier=14)
+         if rank == 0:
++            logger.info('[Timing] student+EMA validation seconds: %.1f', time.perf_counter() - validation_start)
+             logger.info(
+                 '[Epoch {:}] Avg Training Throughput (FPS): {:.1f} img/s'.format(
+                     epoch, total_throughput.avg
+@@ -435,6 +485,8 @@
+                 'model': model.state_dict(),
+                 'model_ema': model_ema.state_dict(),
+                 'optimizer': optimizer.state_dict(),
++                'scaler': scaler.state_dict(),
++                'config': cfg,
+                 'epoch': epoch,
+                 'previous_best': previous_best,
+                 'previous_best_ema': previous_best_ema,
+--- a/evaluation.py
++++ b/evaluation.py
+@@ -1,74 +1,62 @@
+-import argparse
+ import torch
+-import numpy as np
+ import torch.distributed as dist
+ import torch.nn.functional as F
+-from util.utils import count_params, AverageMeter, intersectionAndUnion, init_log
++from util.training_runtime import intersection_union, autocast_settings
+ 
++
++@torch.no_grad()
+ def evaluate(model, loader, mode, cfg, multiplier=None):
++    # Accumulate on the GPU; synchronize the small count array only once.
+     model.eval()
+-    assert mode in ['original', 'center_crop', 'sliding_window']
+-    intersection_meter = AverageMeter()
+-    union_meter = AverageMeter()
+-
+-    with torch.no_grad():
+-        for img, mask, id in loader:
+-            
+-            img = img.cuda()
+-                
++    model = model.module if hasattr(model, 'module') else model
++    device = next(model.parameters()).device
++    assert mode in ('original', 'sliding_window')
++    counts = torch.zeros(2, cfg['nclass'], dtype=torch.int64, device=device)
++    enabled, dtype = autocast_settings(cfg)
++    enabled = enabled and cfg.get('eval_amp', False) and device.type == 'cuda'
++    for img, mask, _ in loader:
++        img = img.to(device, non_blocking=True)
++        mask = mask.to(device, non_blocking=True)
++        ori_h, ori_w = img.shape[-2:]
++        with torch.autocast(device_type=device.type, enabled=enabled, dtype=dtype):
+             if mode == 'sliding_window':
+                 grid = cfg['crop_size']
+                 b, _, h, w = img.shape
+-                final = torch.zeros(b, 19, h, w).cuda()
+-                
++                final = torch.zeros(b, cfg['nclass'], h, w, device=device)
+                 row = 0
+-                while row < h:
++                while True:
+                     col = 0
+-                    while col < w:
+-                        pred = model(img[:, :, row: row + grid, col: col + grid])
+-                        final[:, :, row: row + grid, col: col + grid] += pred.softmax(dim=1)
+-                        if col == w - grid:
++                    while True:
++                        tile = img[:, :, row:row + grid, col:col + grid]
++                        th, tw = tile.shape[-2:]
++                        if multiplier:
++                            tile = F.interpolate(tile, (max(multiplier, round(th / multiplier) * multiplier),
++                                                       max(multiplier, round(tw / multiplier) * multiplier)),
++                                                 mode='bilinear', align_corners=True)
++                        output = model(tile)
++                        output = F.interpolate(output.float(), (th, tw), mode='bilinear', align_corners=True)
++                        final[:, :, row:row + th, col:col + tw] += output.softmax(1)
++                        if col >= max(w - grid, 0):
+                             break
+-                        col = min(col + int(grid * 2 / 3), w - grid)
+-                    if row == h - grid:
++                        col = min(col + max(1, int(grid * 2 / 3)), max(w - grid, 0))
++                    if row >= max(h - grid, 0):
+                         break
+-                    row = min(row + int(grid * 2 / 3), h - grid)
+-                    
+-                pred = final
+-            
++                    row = min(row + max(1, int(grid * 2 / 3)), max(h - grid, 0))
++                logits = final
+             else:
+-                assert mode == 'original'
+-                
+                 if multiplier is not None:
+-                    ori_h, ori_w = img.shape[-2:]
+-                    if multiplier == 512:
+-                        new_h, new_w = 512, 512
+-                    else:
+-                        new_h, new_w = int(ori_h / multiplier + 0.5) * multiplier, int(ori_w / multiplier + 0.5) * multiplier
+-                    img = F.interpolate(img, (new_h, new_w), mode='bilinear', align_corners=True)
+-                
+-                pred = model(img)
+-            
++                    size = ((512, 512) if multiplier == 512 else
++                            (max(multiplier, int(ori_h / multiplier + .5) * multiplier),
++                             max(multiplier, int(ori_w / multiplier + .5) * multiplier)))
++                    img = F.interpolate(img, size, mode='bilinear', align_corners=True)
++                logits = model(img)
+                 if multiplier is not None:
+-                    pred = F.interpolate(pred, (ori_h, ori_w), mode='bilinear', align_corners=True)
+-            
+-            pred = pred.argmax(dim=1)
+-
+-            intersection, union, target = \
+-                intersectionAndUnion(pred.cpu().numpy(), mask.numpy(), cfg['nclass'], 255)
+-
+-            reduced_intersection = torch.from_numpy(intersection).cuda()
+-            reduced_union = torch.from_numpy(union).cuda()
+-            reduced_target = torch.from_numpy(target).cuda()
+-
+-            dist.all_reduce(reduced_intersection)
+-            dist.all_reduce(reduced_union)
+-            dist.all_reduce(reduced_target)
+-
+-            intersection_meter.update(reduced_intersection.cpu().numpy())
+-            union_meter.update(reduced_union.cpu().numpy())
+-
+-    iou_class = intersection_meter.sum / (union_meter.sum + 1e-10) * 100.0
+-    mIOU = np.mean(iou_class)
+-
+-    return mIOU, iou_class+                    logits = F.interpolate(logits, (ori_h, ori_w), mode='bilinear', align_corners=True)
++        intersection, union = intersection_union(logits.argmax(1), mask, cfg['nclass'])
++        counts[0] += intersection
++        counts[1] += union
++    if dist.is_available() and dist.is_initialized():
++        dist.all_reduce(counts)
++    values = counts.cpu().numpy()
++    iou = values[0] / (values[1] + 1e-10) * 100.0
++    return iou.mean(), iou
+--- a/test.py
++++ b/test.py
+@@ -8,6 +8,7 @@
+ from tqdm import tqdm
+ import math
+ from dataset.semi import SemiDataset
++from util.training_runtime import load_segmentation_state
+ 
+ try:
+     from model.semseg.dpt import DPT
+@@ -104,13 +105,8 @@
+         else:
+             new_state_dict[k] = v
+ 
+-    try:
+-        model.load_state_dict(new_state_dict, strict=True)
+-        print("Successfully loaded model weights (strict=True).")
+-    except Exception as e:
+-        print(f"Strict load failed: {e}")
+-        print("Trying strict=False...")
+-        model.load_state_dict(new_state_dict, strict=False)
++    load_segmentation_state(model, new_state_dict)
++    print('Loaded segmentation weights; training-only CTSA parameters excluded.')
+ 
+     model.cuda()
+     model.eval()
+--- a/model/semseg/dpt.py
++++ b/model/semseg/dpt.py
+@@ -5,6 +5,7 @@
+ 
+ from model.backbone.dinov2 import DINOv2
+ from model.util.blocks import FeatureFusionBlock, _make_scratch
++from model.semseg.ctsa import CTSA
+ 
+ 
+ def _make_fusion_block(features, use_bn, size=None):
+@@ -82,23 +83,13 @@
+             nn.Conv2d(features, nclass, kernel_size=1, stride=1, padding=0)
+         )
+     
+-    def forward(self, out_features, patch_h, patch_w):
+-        out = []
+-        for i, x in enumerate(out_features):
+-            x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], patch_h, patch_w))
+-            
+-            x = self.projects[i](x)
+-            x = self.resize_layers[i](x)
+-            
+-            out.append(x)
+-        
+-        layer_1, layer_2, layer_3, layer_4 = out
+-        
+-        layer_1_rn = self.scratch.layer1_rn(layer_1)
+-        layer_2_rn = self.scratch.layer2_rn(layer_2)
+-        layer_3_rn = self.scratch.layer3_rn(layer_3)
+-        layer_4_rn = self.scratch.layer4_rn(layer_4)
+-        
++    def project(self, x, i, patch_h, patch_w):
++        x = x.permute(0, 2, 1).reshape(x.shape[0], x.shape[-1], patch_h, patch_w)
++        x = self.resize_layers[i](self.projects[i](x))
++        return getattr(self.scratch, 'layer%d_rn' % (i + 1))(x)
++
++    def decode(self, projected):
++        layer_1_rn, layer_2_rn, layer_3_rn, layer_4_rn = projected
+         path_4 = self.scratch.refinenet4(layer_4_rn, size=layer_3_rn.shape[2:])        
+         path_3 = self.scratch.refinenet3(path_4, layer_3_rn, size=layer_2_rn.shape[2:])
+         path_2 = self.scratch.refinenet2(path_3, layer_2_rn, size=layer_1_rn.shape[2:])
+@@ -107,6 +98,16 @@
+         out = self.scratch.output_conv(path_1)
+         
+         return out
++
++    def forward(self, out_features, patch_h, patch_w, aux_last=None, num_labeled=0):
++        projected = [self.project(x, i, patch_h, patch_w) for i, x in enumerate(out_features)]
++        out = self.decode(projected)
++        if aux_last is None:
++            return out
++        # Reuse the first three projected student features as well as the encoder.
++        auxiliary = [x[num_labeled:] for x in projected[:3]]
++        auxiliary.append(self.project(aux_last, 3, patch_h, patch_w))
++        return out, self.decode(auxiliary)
+ 
+ 
+ class DPT(nn.Module):
+@@ -117,6 +118,7 @@
+         features=128, 
+         out_channels=[96, 192, 384, 768], 
+         use_bn=False,
++        ctsa_config=None,
+     ):
+         super(DPT, self).__init__()
+         
+@@ -133,17 +135,27 @@
+         self.head = DPTHead(nclass, self.backbone.embed_dim, features, use_bn, out_channels=out_channels)
+         
+         self.binomial = torch.distributions.binomial.Binomial(probs=0.5)
++        self.ctsa = None
++        if ctsa_config and ctsa_config.get('use_ctsa', False):
++            self.ctsa = CTSA(
++                self.backbone.embed_dim, dim=ctsa_config.get('ctsa_dim', 128),
++                heads=ctsa_config.get('ctsa_heads', 4),
++                alpha=ctsa_config.get('ctsa_alpha', 0.1),
++                temperature=ctsa_config.get('ctsa_temperature', 0.1),
++                gate_statistics=ctsa_config.get('ctsa_gate_statistics', False))
+         
+     def lock_backbone(self):
+         for p in self.backbone.parameters():
+             p.requires_grad = False
+     
+-    def forward(self, x, comp_drop=False):
++    def forward(self, x, comp_drop=False, return_last_feature=False,
++                teacher_feature=None, ctsa_gate=None, num_labeled=0):
+         patch_h, patch_w = x.shape[-2] // 14, x.shape[-1] // 14
+         
+         features = self.backbone.get_intermediate_layers(
+             x, self.intermediate_layer_idx[self.encoder_size]
+         )
++        features = tuple(features)
+         
+         if comp_drop:
+             bs, dim = features[0].shape[0], features[0].shape[-1]
+@@ -158,15 +170,21 @@
+             
+             dropout_mask = torch.cat((dropout_mask1, dropout_mask2))
+             
+-            features = (feature * dropout_mask.unsqueeze(1) for feature in features)
+-            
+-            out = self.head(features, patch_h, patch_w)
+-            
+-            out = F.interpolate(out, (patch_h * 14, patch_w * 14), mode='bilinear', align_corners=True)
+-            
+-            return out
+-        
++            features = tuple(feature * dropout_mask.unsqueeze(1) for feature in features)
++
++        if teacher_feature is not None:
++            if self.ctsa is None:
++                raise ValueError('teacher_feature requires use_ctsa=True')
++            if return_last_feature:
++                raise ValueError('Auxiliary and teacher feature outputs are separate modes')
++            aux_last = self.ctsa(features[-1][num_labeled:], teacher_feature, ctsa_gate)
++            out, aux = self.head(features, patch_h, patch_w, aux_last, num_labeled)
++            size = (patch_h * 14, patch_w * 14)
++            return (F.interpolate(out, size, mode='bilinear', align_corners=True),
++                    F.interpolate(aux, size, mode='bilinear', align_corners=True))
++
+         out = self.head(features, patch_h, patch_w)
+         out = F.interpolate(out, (patch_h * 14, patch_w * 14), mode='bilinear', align_corners=True)
+-        
++        if return_last_feature:
++            return out, features[-1]
+         return out
+--- a/model/semseg/ctsa.py
++++ b/model/semseg/ctsa.py
+@@ -0,0 +1,51 @@
++"""Training-only, per-image channel cross-attention (not spatial N x N attention)."""
++import torch
++from torch import nn
++from torch.nn import functional as F
++
++
++class CTSA(nn.Module):
++    def __init__(self, channels, dim=128, heads=4, alpha=0.1,
++                 temperature=0.1, gate_statistics=False):
++        super().__init__()
++        if dim <= 0 or heads <= 0 or dim % heads or temperature <= 0:
++            raise ValueError('CTSA requires positive dim/heads/temperature and dim % heads == 0')
++        self.heads, self.dim = heads, dim
++        self.alpha, self.temperature = alpha, temperature
++        self.gate_statistics = gate_statistics
++        self.student_norm = nn.LayerNorm(channels)
++        self.teacher_norm = nn.LayerNorm(channels)
++        self.q = nn.Linear(channels, dim, bias=False)
++        self.k = nn.Linear(channels, dim, bias=False)
++        self.v = nn.Linear(channels, dim, bias=False)
++        self.out = nn.Linear(dim, channels, bias=False)
++
++    def forward(self, student, teacher, gate=None):
++        if student.shape != teacher.shape or student.ndim != 3:
++            raise ValueError('CTSA expects matching [B, N, C] student/teacher features')
++        b, n, _ = student.shape
++        if gate is None:
++            gate = student.new_ones(b, n, 1)
++        if gate.shape != (b, n, 1):
++            raise ValueError('CTSA gate must have shape [B, N, 1]')
++        gate = gate.detach().float().clamp(0, 1)
++        s = self.student_norm(student)
++        t = self.teacher_norm(teacher.detach())  # projection parameters still learn
++
++        def split(x):
++            return x.reshape(b, n, self.heads, self.dim // self.heads).permute(0, 2, 3, 1)
++
++        q, k, v = split(self.q(s)), split(self.k(t)), split(self.v(t))
++        # Spatial reductions and cosine logits in fp32, including under AMP.
++        with torch.autocast(device_type=student.device.type, enabled=False):
++            q, k = q.float(), k.float()
++            if self.gate_statistics:
++                weight = gate.transpose(1, 2).unsqueeze(1).sqrt()
++                q, k = q * weight, k * weight
++            q = F.normalize(q, dim=-1, eps=1e-6)
++            k = F.normalize(k, dim=-1, eps=1e-6)
++            attention = ((q @ k.transpose(-2, -1)) / self.temperature).softmax(-1)
++            mixed = attention @ v.float()
++        mixed = mixed.permute(0, 3, 1, 2).reshape(b, n, self.dim).to(v.dtype)
++        residual = self.out(mixed)
++        return student + self.alpha * gate.to(residual.dtype) * residual
+--- a/model/semseg/vlm_runtime.py
++++ b/model/semseg/vlm_runtime.py
+@@ -0,0 +1,115 @@
++"""Optional batched Qwen execution around the UNMODIFIED CEE/VLM-PP policy.
++
++Prefetch text for exactly the images the parent will process, then let the
++parent perform all SAM, CEE selection, label replacement and confidence fusion.
++No cross-image/iteration cache is introduced here. Batch size 1 is the fallback.
++"""
++from collections import deque
++import logging
++import torch
++from torch.nn import functional as F
++from model.semseg.vlm_pp import QwenVLPurifiedSemi
++
++
++class BatchedQwenVLPurifiedSemi(QwenVLPurifiedSemi):
++    def __init__(self, cfg, model, model_ema, class_names):
++        self.qwen_batch_size = int(cfg.get('qwen_batch_size', 1))
++        if self.qwen_batch_size < 1:
++            raise ValueError('qwen_batch_size must be at least 1')
++        self._prefetched = None
++        super().__init__(cfg, model, model_ema, class_names)
++
++    def _load_qwen_model(self):
++        from transformers import BitsAndBytesConfig, AutoProcessor, Qwen2_5_VLForConditionalGeneration
++        # DDP: every process owns one Qwen copy on its own GPU, rather than
++        # every process's device_map='auto' spanning all visible GPUs.
++        device_map = self.cfg.get('qwen_device_map', None)
++        if device_map is None:
++            distributed = torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1
++            device_map = {'': torch.cuda.current_device()} if distributed else 'auto'
++        kwargs = dict(torch_dtype=torch.float16, device_map=device_map,
++                      attn_implementation=self.cfg.get('qwen_attention', 'sdpa'))
++        if self.use_4bit:
++            kwargs['quantization_config'] = BitsAndBytesConfig(
++                load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16,
++                bnb_4bit_quant_type='nf4')
++        self.qwen_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(self.model_name, **kwargs)
++        self.qwen_model.eval()
++        self.processor = AutoProcessor.from_pretrained(
++            self.model_name, min_pixels=128 * 28 * 28, max_pixels=256 * 28 * 28)
++        self.processor.tokenizer.padding_side = 'left'
++
++    def _run_qwen(self, messages):
++        if self._prefetched is not None:
++            if not self._prefetched:
++                raise RuntimeError('CEE/VLM prefetch order mismatch')
++            return self._prefetched.popleft()
++        return super()._run_qwen(messages)
++
++    def _run_batch(self, conversations):
++        from qwen_vl_utils import process_vision_info
++        texts = [self.processor.apply_chat_template(
++            messages, tokenize=False, add_generation_prompt=True) for messages in conversations]
++        images, videos = process_vision_info(conversations)
++        inputs = self.processor(text=texts, images=images, videos=videos,
++                                padding=True, return_tensors='pt').to(self.qwen_model.device)
++        with torch.no_grad():
++            output = self.qwen_model.generate(**inputs, max_new_tokens=256, do_sample=False)
++        output = output[:, inputs.input_ids.shape[1]:]
++        return self.processor.batch_decode(output, skip_special_tokens=True)
++
++    def _generate_chunks(self, conversations):
++        results = []
++        for offset in range(0, len(conversations), self.qwen_batch_size):
++            chunk = conversations[offset:offset + self.qwen_batch_size]
++            outputs = None
++            oom = False
++            try:
++                outputs = self._run_batch(chunk)
++            except torch.cuda.OutOfMemoryError:
++                if len(chunk) == 1:
++                    raise
++                oom = True
++            # Outside the except block so the failed batch's traceback/tensors
++            # are released before retrying with a smaller memory footprint.
++            if oom:
++                torch.cuda.empty_cache()
++                logging.getLogger('global').warning('Qwen batch OOM; retrying this batch serially')
++                outputs = [super(BatchedQwenVLPurifiedSemi, self)._run_qwen(x) for x in chunk]
++            if len(outputs) != len(chunk):
++                raise RuntimeError('Qwen output count does not match input count')
++            results.extend(outputs)
++        return results
++
++    def get_qwen_purify(self, images, pseudo_labels, conf_scores, edge_map=None):
++        if self.qwen_batch_size == 1:
++            return super().get_qwen_purify(images, pseudo_labels, conf_scores, edge_map)
++
++        # Read-only scheduling mirror. The parent's original implementation
++        # remains the authority for all pixel masks and purification decisions.
++        priority = conf_scores < self.vlm_pp_conf_threshold
++        if self.use_cee and self.use_cee_vlm and edge_map is not None:
++            edge = edge_map
++            if tuple(edge.shape) != tuple(pseudo_labels.shape):
++                edge = F.interpolate(edge.float().unsqueeze(1),
++                                     size=pseudo_labels.shape[-2:], mode='nearest').squeeze(1).bool()
++            priority = priority & edge
++            if priority.sum().item() < self.min_edge_pixels:
++                return super().get_qwen_purify(images, pseudo_labels, conf_scores, edge_map)
++        infer = (not self.use_vlm_cache or
++                 (self.current_iter + 1) % self.inference_interval == 0 or
++                 self.cached_spatial_probs is None)
++        indices = priority.flatten(1).any(1).nonzero().flatten().tolist() if infer else []
++        if len(indices) < 2:
++            return super().get_qwen_purify(images, pseudo_labels, conf_scores, edge_map)
++        conversations = [[{'role': 'user', 'content': [
++            {'type': 'image', 'image': self._tensor_to_pil(images[b])},
++            {'type': 'text', 'text': self.grounding_prompt}]}] for b in indices]
++        self._prefetched = deque(self._generate_chunks(conversations))
++        try:
++            result = super().get_qwen_purify(images, pseudo_labels, conf_scores, edge_map)
++            if self._prefetched:
++                raise RuntimeError('Unused Qwen outputs: CEE/VLM scheduling mismatch')
++            return result
++        finally:
++            self._prefetched = None
+--- a/model/backbone/dinov2_layers/attention.py
++++ b/model/backbone/dinov2_layers/attention.py
+@@ -12,6 +12,7 @@
+ 
+ from torch import Tensor
+ from torch import nn
++from torch.nn import functional as F
+ 
+ 
+ logger = logging.getLogger("dinov2")
+@@ -50,13 +51,12 @@
+         B, N, C = x.shape
+         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+ 
+-        q, k, v = qkv[0] * self.scale, qkv[1], qkv[2]
+-        attn = q @ k.transpose(-2, -1)
+-
+-        attn = attn.softmax(dim=-1)
+-        attn = self.attn_drop(attn)
+-
+-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
++        q, k, v = qkv.unbind(0)
++        # PyTorch dispatches to an efficient CUDA kernel when supported;
++        # the CPU/math backend remains available. Same attention definition.
++        x = F.scaled_dot_product_attention(
++            q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)
++        x = x.transpose(1, 2).reshape(B, N, C)
+         x = self.proj(x)
+         x = self.proj_drop(x)
+         return x
+@@ -80,4 +80,4 @@
+         x = self.proj_drop(x)
+         return x
+ 
+-        +        
+--- a/dataset/semi.py
++++ b/dataset/semi.py
+@@ -13,11 +13,12 @@
+ 
+ 
+ class SemiDataset(Dataset):
+-    def __init__(self, name, root, mode, size=None, id_path=None, nsample=None):
++    def __init__(self, name, root, mode, size=None, id_path=None, nsample=None, single_strong=False):
+         self.name = name
+         self.root = root
+         self.mode = mode
+         self.size = size
++        self.single_strong = single_strong
+         
+         if mode == 'train_l' or mode == 'train_u':
+             with open(id_path, 'r') as f:
+@@ -49,13 +50,24 @@
+         if self.mode == 'train_l':
+             return normalize(img, mask)
+         
+-        img_w, img_s1, img_s2 = deepcopy(img), deepcopy(img), deepcopy(img)
++        img_w, img_s1 = deepcopy(img), deepcopy(img)
++        if not self.single_strong:
++            img_s2 = deepcopy(img)
+ 
+         if random.random() < 0.8:
+             img_s1 = transforms.ColorJitter(0.5, 0.5, 0.5, 0.25)(img_s1)
+         img_s1 = transforms.RandomGrayscale(p=0.2)(img_s1)
+         img_s1 = blur(img_s1, p=0.5)
+         cutmix_box1 = obtain_cutmix_box(img_s1.size[0], p=0.5)
++
++        if self.single_strong:
++            # This trainer consumes only one strong view. Keep the old default
++            # for other callers, but avoid generating/collating unused tensors.
++            ignore_mask = Image.fromarray(np.zeros((mask.size[1], mask.size[0])))
++            img_s1, ignore_mask = normalize(img_s1, ignore_mask)
++            mask = torch.from_numpy(np.array(mask)).long()
++            ignore_mask[mask == 254] = 255
++            return normalize(img_w), img_s1, ignore_mask, cutmix_box1
+ 
+         if random.random() < 0.8:
+             img_s2 = transforms.ColorJitter(0.5, 0.5, 0.5, 0.25)(img_s2)
+--- a/util/ctsa.py
++++ b/util/ctsa.py
+@@ -0,0 +1,65 @@
++"""Alignment and loss helpers. The existing CEE acceptance mask is an input."""
++import torch
++from torch.nn import functional as F
++
++
++def cutmix_tensor(tensor, box):
++    """Use exactly the training loop's flip(0) partner and binary pixel mask."""
++    mask = box.bool()
++    if tensor.ndim == mask.ndim + 1:
++        mask = mask.unsqueeze(1)
++    return torch.where(mask, tensor.flip(0), tensor)
++
++
++@torch.no_grad()
++def prepare_ctsa(teacher, raw_labels, labels, confidence, accepted, box,
++                 patch_hw, mode='agreement', reject_corrected=True):
++    """Teacher is [B,N,C] BEFORE CutMix; the other maps are AFTER CutMix.
++
++    Pooling a binary CutMix mask also identifies patches crossing its seam.
++    Feature mixing after ViT encoding is an approximation (global context).
++    """
++    if mode not in ('none', 'confidence', 'agreement'):
++        raise ValueError('ctsa_gate must be none, confidence or agreement')
++    ph, pw = patch_hw
++    b, n, c = teacher.shape
++    if n != ph * pw:
++        raise ValueError('Teacher token count does not match patch grid')
++    pool = lambda x: F.adaptive_avg_pool2d(x.float().unsqueeze(1), (ph, pw))
++    fraction = pool(box)
++    pure_patch = (fraction == 0) | (fraction == 1)
++    feature_box = fraction >= 0.5
++    feature_map = teacher.transpose(1, 2).reshape(b, c, ph, pw)
++    mixed = torch.where(feature_box, feature_map.flip(0), feature_map)
++    if mode == 'none':
++        gate = torch.ones_like(fraction)
++    else:
++        reliability = accepted.float() * confidence.float()
++        if mode == 'agreement':
++            reliability = reliability * (raw_labels == labels)
++        gate = pool(reliability)
++        if mode == 'agreement' and reject_corrected:
++            gate = gate * (pool(raw_labels != labels) == 0)
++    gate = gate * pure_patch
++    gate = gate.flatten(2).transpose(1, 2).contiguous()
++    active = gate.flatten(1).sum(1) > 0
++    return mixed.flatten(2).transpose(1, 2).contiguous(), gate, active
++
++
++def auxiliary_loss(logits, labels, accepted, ignore, active):
++    # Keep CEE's threshold selection AND the baseline non-ignore denominator.
++    per_pixel = F.cross_entropy(logits.float(), labels, reduction='none', ignore_index=255)
++    weight = accepted & (ignore != 255) & active[:, None, None]
++    return (per_pixel * weight).sum() / (ignore != 255).sum().clamp_min(1)
++
++
++def ctsa_weight(step, total_steps, cfg):
++    progress = step / max(total_steps, 1)
++    warmup = float(cfg.get('ctsa_warmup_ratio', 0.1))
++    ramp = float(cfg.get('ctsa_ramp_ratio', 0.1))
++    maximum = float(cfg.get('ctsa_weight', 0.1))
++    if not (0 <= warmup < 1 and 0 <= ramp <= 1 - warmup and maximum >= 0):
++        raise ValueError('Invalid CTSA warmup/ramp/weight')
++    if progress < warmup:
++        return 0.0
++    return maximum * min(1.0, (progress - warmup) / max(ramp, 1e-12)) if ramp else maximum
+--- a/util/training_runtime.py
++++ b/util/training_runtime.py
+@@ -0,0 +1,82 @@
++"""Runtime helpers independent of CEE's edge/pseudo-label decisions."""
++import torch
++
++
++def autocast_settings(cfg):
++    enabled = bool(cfg.get('amp', True)) and torch.cuda.is_available()
++    name = cfg.get('amp_dtype', 'auto')
++    if name not in ('auto', 'bf16', 'fp16'):
++        raise ValueError('amp_dtype must be auto, bf16 or fp16')
++    bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
++    if enabled and name == 'bf16' and not bf16:
++        raise ValueError('bf16 requested but unsupported; use auto or fp16')
++    dtype = torch.bfloat16 if name == 'bf16' or (name == 'auto' and bf16) else torch.float16
++    return enabled, dtype
++
++
++def loader_options(cfg, validation=False):
++    workers = int(cfg.get('val_num_workers' if validation else 'num_workers', 1 if validation else 4))
++    kwargs = dict(num_workers=workers, pin_memory=True)
++    if workers > 0:
++        kwargs.update(persistent_workers=bool(cfg.get('persistent_workers', True)),
++                      prefetch_factor=int(cfg.get('prefetch_factor', 2)))
++    return kwargs
++
++
++@torch.no_grad()
++def update_ema(student, teacher, decay):
++    student = student.module if hasattr(student, 'module') else student
++    params = dict(student.named_parameters())
++    for name, dest in teacher.named_parameters():
++        dest.lerp_(params[name].detach(), 1 - decay)
++    buffers = dict(student.named_buffers())
++    for name, dest in teacher.named_buffers():
++        source = buffers[name].detach()
++        if dest.is_floating_point():
++            dest.lerp_(source, 1 - decay)
++        else:
++            dest.copy_(source)
++
++
++def load_segmentation_state(model, state, allow_missing_ctsa=False):
++    """Strict for backbone/head; only the known training-only namespace is optional."""
++    model = model.module if hasattr(model, 'module') else model
++    state = {k.removeprefix('module.'): v for k, v in state.items()}
++    if getattr(model, 'ctsa', None) is None:
++        state = {k: v for k, v in state.items() if not k.startswith('ctsa.')}
++    missing, extra = model.load_state_dict(state, strict=False)
++    bad_missing = [k for k in missing if not (allow_missing_ctsa and k.startswith('ctsa.'))]
++    if bad_missing or extra:
++        raise RuntimeError(f'Checkpoint mismatch: missing={bad_missing}, unexpected={extra}')
++
++
++class StepTimer:
++    """Diagnostic mode only; normal iterations do not synchronize the GPU."""
++    def __init__(self, enabled):
++        self.enabled = enabled
++        self.events = []
++        if enabled:
++            self.mark('start')
++
++    def mark(self, name):
++        if self.enabled:
++            event = torch.cuda.Event(enable_timing=True)
++            event.record()
++            self.events.append((name, event))
++
++    def finish(self):
++        if not self.enabled:
++            return {}
++        torch.cuda.synchronize()
++        return {name: prev.elapsed_time(event)
++                for (_, prev), (name, event) in zip(self.events, self.events[1:])}
++
++
++def intersection_union(pred, target, classes):
++    pred, target = pred.reshape(-1), target.reshape(-1)
++    valid = target != 255
++    pred, target = pred[valid], target[valid]
++    intersection = torch.bincount(pred[pred == target], minlength=classes)[:classes]
++    output = torch.bincount(pred, minlength=classes)[:classes]
++    truth = torch.bincount(target, minlength=classes)[:classes]
++    return intersection, output + truth - intersection
+--- a/test_ctsa.py
++++ b/test_ctsa.py
+@@ -0,0 +1,234 @@
++"""CPU-capable correctness tests; no pretrained weights, Qwen or datasets needed.
++
++Run: python -m unittest test_ctsa -v
++"""
++import copy
++import importlib.util
++import sys
++import types
++import unittest
++import random
++from unittest import mock
++import numpy as np
++import torch
++from torch.nn import functional as F
++from model.semseg.ctsa import CTSA
++from model.semseg.dpt import DPT
++from model.backbone.dinov2_layers.attention import Attention
++from util.ctsa import prepare_ctsa, cutmix_tensor, auxiliary_loss, ctsa_weight
++from util.cee import extract_multi_class_edge
++from util.training_runtime import update_ema, load_segmentation_state, intersection_union
++from util.utils import intersectionAndUnion
++
++torch.set_num_threads(2)
++
++
++class CTSATests(unittest.TestCase):
++    def setUp(self):
++        torch.manual_seed(19)
++
++    def test_gradient_direction_and_zero_gate(self):
++        module = CTSA(24, dim=16, heads=4, gate_statistics=True)
++        student = torch.randn(2, 9, 24, requires_grad=True)
++        teacher = torch.randn_like(student, requires_grad=True)
++        gate = torch.ones(2, 9, 1)
++        module(student, teacher, gate).square().mean().backward()
++        self.assertIsNone(teacher.grad)
++        for name in ('q', 'k', 'v', 'out'):
++            self.assertGreater(getattr(module, name).weight.grad.abs().sum().item(), 0)
++        module.zero_grad(set_to_none=True)
++        out = module(student, teacher, torch.zeros_like(gate))
++        torch.testing.assert_close(out, student, rtol=0, atol=0)
++        out.sum().backward()
++        self.assertTrue(all(p.grad is not None and torch.isfinite(p.grad).all() for p in module.parameters()))
++
++    def test_no_cross_sample_attention(self):
++        module = CTSA(24, dim=16, heads=4).eval()
++        s, t = torch.randn(2, 9, 24), torch.randn(2, 9, 24)
++        full = module(s, t)
++        separate = torch.cat([module(s[i:i+1], t[i:i+1]) for i in range(2)])
++        torch.testing.assert_close(full, separate)
++
++    def test_cutmix_alignment_and_gate_modes(self):
++        teacher = torch.stack([torch.ones(4, 3), torch.full((4, 3), 9.)])
++        box = torch.zeros(2, 4, 4); box[:, :, 2:] = 1
++        labels = torch.zeros(2, 4, 4, dtype=torch.long)
++        raw = labels.clone(); raw[:, 0, 0] = 1
++        conf = torch.full((2, 4, 4), .8)
++        accepted = torch.ones_like(labels, dtype=torch.bool)
++        mixed, gate, active = prepare_ctsa(teacher, raw, labels, conf, accepted, box, (2, 2))
++        torch.testing.assert_close(mixed[0, :, 0], torch.tensor([1., 9., 1., 9.]))
++        self.assertEqual(gate[0, 0, 0], 0)
++        _, confidence_gate, _ = prepare_ctsa(teacher, raw, labels, conf, accepted, box,
++                                            (2, 2), mode='confidence')
++        self.assertGreater(confidence_gate[0, 0, 0], 0)
++        box[:, :, 1:] = 1  # first patch column straddles the seam
++        _, gate, _ = prepare_ctsa(teacher, labels, labels, conf, accepted, box, (2, 2), mode='none')
++        self.assertEqual(gate[0, 0, 0], 0)
++        self.assertEqual(gate[0, 2, 0], 0)
++
++    def test_cee_acceptance_is_used_in_auxiliary_loss(self):
++        labels = torch.zeros(2, 8, 8, dtype=torch.long); labels[:, :, 4:] = 1
++        edges = extract_multi_class_edge(labels, edge_width=1)
++        confidence = torch.full_like(labels, .8, dtype=torch.float)
++        accepted = ((~edges) & (confidence >= .95)) | (edges & (confidence >= .75))
++        self.assertTrue(torch.equal(accepted, edges))
++        logits = torch.randn(2, 2, 8, 8, requires_grad=True)
++        ignore = torch.zeros_like(labels)
++        expected = (F.cross_entropy(logits, labels, reduction='none') * edges).sum() / labels.numel()
++        result = auxiliary_loss(logits, labels, accepted, ignore, torch.ones(2, dtype=torch.bool))
++        torch.testing.assert_close(result, expected)
++        zero = auxiliary_loss(logits, labels, accepted, torch.full_like(ignore, 255),
++                              torch.zeros(2, dtype=torch.bool))
++        self.assertEqual(zero.item(), 0)
++        zero.backward()
++        self.assertTrue(torch.isfinite(logits.grad).all())
++
++    def test_sdpa_matches_manual_attention(self):
++        layer = Attention(24, num_heads=4, qkv_bias=True).eval()
++        x = torch.randn(2, 13, 24)
++        q, k, v = layer.qkv(x).reshape(2, 13, 3, 4, 6).permute(2, 0, 3, 1, 4)
++        expected = (((q * layer.scale) @ k.transpose(-1, -2)).softmax(-1) @ v)
++        expected = layer.proj(expected.transpose(1, 2).reshape(2, 13, 24))
++        torch.testing.assert_close(layer(x), expected, rtol=1e-5, atol=1e-6)
++
++    def test_gpu_metric_formula_matches_original_numpy(self):
++        pred = torch.randint(0, 8, (2, 21, 19))
++        target = torch.randint(0, 8, pred.shape); target[:, :2] = 255
++        original_i, original_u, _ = intersectionAndUnion(pred.numpy(), target.numpy(), 8, 255)
++        actual_i, actual_u = intersection_union(pred, target, 8)
++        np.testing.assert_array_equal(actual_i.numpy(), original_i)
++        np.testing.assert_array_equal(actual_u.numpy(), original_u)
++
++    def test_real_dino_dpt_backward_checkpoint_and_ema(self):
++        cfg = dict(use_ctsa=True, ctsa_dim=32, ctsa_heads=4)
++        model = DPT('small', 3, features=16, out_channels=[16]*4, ctsa_config=cfg)
++        teacher = copy.deepcopy(model); teacher.ctsa = None
++        teacher.eval().requires_grad_(False)
++        x = torch.randn(3, 3, 56, 56)
++        with torch.no_grad():
++            ordinary_before = model(x)
++            _, feature = teacher(x[1:], return_last_feature=True)
++        opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
++        before = model.ctsa.k.weight.detach().clone()
++        logits, aux = model(x, teacher_feature=feature, ctsa_gate=torch.ones(2, 16, 1), num_labeled=1)
++        torch.testing.assert_close(logits, ordinary_before, atol=1e-6, rtol=1e-5)
++        self.assertEqual(tuple(aux.shape), (2, 3, 56, 56))
++        loss = logits.square().mean() + aux.square().mean()
++        loss.backward(); opt.step()
++        self.assertFalse(torch.equal(before, model.ctsa.k.weight))
++        self.assertTrue(all(p.grad is None for p in teacher.parameters()))
++        update_ema(model, teacher, 0)
++        for name, value in teacher.named_parameters():
++            torch.testing.assert_close(value, dict(model.named_parameters())[name])
++        deployment = copy.deepcopy(teacher)
++        load_segmentation_state(deployment, {'module.'+k:v for k,v in model.state_dict().items()})
++        torch.testing.assert_close(deployment(x), model.eval()(x))
++        # Original CEE checkpoint can initialize only the newly added CTSA parameters.
++        load_segmentation_state(model, teacher.state_dict(), allow_missing_ctsa=True)
++
++    def test_schedule(self):
++        cfg = dict(ctsa_weight=.1, ctsa_warmup_ratio=.1, ctsa_ramp_ratio=.1)
++        self.assertEqual(ctsa_weight(0, 100, cfg), 0)
++        self.assertAlmostEqual(ctsa_weight(15, 100, cfg), .05)
++        self.assertAlmostEqual(ctsa_weight(99, 100, cfg), .1)
++
++    def test_single_strong_preserves_consumed_views(self):
++        from PIL import Image
++        from dataset.semi import SemiDataset
++        image = Image.fromarray(np.random.default_rng(4).integers(0, 255, (56, 56, 3), dtype=np.uint8))
++        legacy = SemiDataset.__new__(SemiDataset)
++        legacy.name='loveda'; legacy.root=''; legacy.mode='train_u'
++        legacy.size=28; legacy.ids=['image.png']; legacy.single_strong=False
++        optimized = copy.copy(legacy); optimized.single_strong=True
++        def seed():
++            random.seed(7); np.random.seed(7); torch.manual_seed(7)
++        with mock.patch('dataset.semi.Image.open', side_effect=lambda _: image.copy()):
++            seed(); old = legacy[0]
++            seed(); new = optimized[0]
++        for expected, actual in zip([old[0], old[1], old[3], old[4]], new):
++            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
++
++
++
++class VLMBatchingTests(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        # These tests exercise the REAL unmodified CEE policy and SAM-free
++        # spatial construction, with only the external Qwen model substituted.
++        stubs = {}
++        if importlib.util.find_spec('transformers') is None:
++            hf = types.ModuleType('transformers')
++            hf.Qwen2_5_VLForConditionalGeneration = object
++            hf.AutoProcessor = object
++            stubs['transformers'] = hf
++        if importlib.util.find_spec('qwen_vl_utils') is None:
++            qwen = types.ModuleType('qwen_vl_utils')
++            qwen.process_vision_info = lambda x: (None, None)
++            stubs['qwen_vl_utils'] = qwen
++        with mock.patch.dict(sys.modules, stubs):
++            from model.semseg.vlm_pp import QwenVLPurifiedSemi
++            from model.semseg.vlm_runtime import BatchedQwenVLPurifiedSemi
++            cls.base, cls.batched = QwenVLPurifiedSemi, BatchedQwenVLPurifiedSemi
++
++    def make_pair(self, use_cee=True, mismatch=True, minimum=0, cache=False):
++        def setup(kind):
++            obj = kind.__new__(kind)
++            obj.vlm_pp_conf_threshold=.7; obj.current_iter=0
++            obj.use_cee=use_cee; obj.use_cee_vlm=True; obj.cee_debug=False
++            obj.min_edge_pixels=minimum; obj.edge_vlm_weight=1.5
++            obj.use_vlm_on_mismatch=mismatch; obj.use_vlm_cache=cache
++            obj.inference_interval=2; obj.cached_spatial_probs=None; obj.cached_shape=None
++            obj.num_classes=3; obj.class_names=['road','building','tree']
++            obj.use_sam=False; obj.bbox_confidence=.95; obj.grounding_prompt='Locate classes'
++            obj.qwen_batch_size=2; obj._prefetched=None
++            return obj
++        base, batch = setup(self.base), setup(self.batched)
++        def prediction(messages):
++            pixel = messages[0]['content'][0]['image'].getpixel((0,0))[0]
++            name = base.class_names[pixel % 3]
++            return f'{name}: [0, 0, 8, 8]'
++        base._run_qwen = prediction
++        batch._run_batch = mock.Mock(side_effect=lambda conversations: [prediction(m) for m in conversations])
++        # Fallback to original single-image method without loading a model.
++        return base, batch, prediction
++
++    def test_batched_matches_original_cee_masks_labels_and_confidence(self):
++        for use_cee in (False, True):
++            for mismatch in (False, True):
++                base, batch, prediction = self.make_pair(use_cee, mismatch)
++                images = torch.randn(4, 3, 8, 8)
++                labels = torch.zeros(4, 8, 8, dtype=torch.long)
++                conf = torch.full((4, 8, 8), .2)
++                edges = torch.ones_like(labels, dtype=torch.bool); edges[1] = False
++                with mock.patch.object(self.base, '_run_qwen', side_effect=prediction):
++                    expected = base.get_qwen_purify(images, labels, conf, edges)
++                    actual = batch.get_qwen_purify(images, labels, conf, edges)
++                if mismatch:
++                    for a,b in zip(actual, expected):
++                        torch.testing.assert_close(a,b,rtol=0,atol=0)
++                else:
++                    torch.testing.assert_close(actual, expected,rtol=0,atol=0)
++                self.assertTrue(batch._run_batch.called)
++                self.assertIsNone(batch._prefetched)
++
++    def test_skip_and_cache_scheduling_preserved(self):
++        base, batch, prediction = self.make_pair(minimum=1000)
++        images = torch.randn(3,3,8,8); labels = torch.zeros(3,8,8,dtype=torch.long)
++        conf = torch.full((3,8,8),.2); edge = torch.ones_like(labels,dtype=torch.bool)
++        actual = batch.get_qwen_purify(images,labels,conf,edge)
++        self.assertFalse(batch._run_batch.called)
++        torch.testing.assert_close(actual[0],conf)
++        base, batch, prediction = self.make_pair(cache=True)
++        # Identical scheduling to the inherited implementation, including the
++        # existing explicitly enabled cache; this optimization does not enable it.
++        with mock.patch.object(self.base, '_run_qwen', side_effect=prediction):
++            for _ in range(3):
++                a=base.get_qwen_purify(images,labels,conf,edge)
++                b=batch.get_qwen_purify(images,labels,conf,edge)
++                for x,y in zip(a,b): torch.testing.assert_close(x,y,rtol=0,atol=0)
++        self.assertEqual(batch._run_batch.call_count,4)  # two chunks on calls 1 and 2
++
++
++if __name__ == '__main__':
++    unittest.main()
+--- a/test_ctsa_ddp.py
++++ b/test_ctsa_ddp.py
+@@ -0,0 +1,81 @@
++"""Two-process CPU/Gloo smoke test for warmup -> CTSA and unequal gate coverage.
++
++Run: python test_ctsa_ddp.py
++No dataset, CUDA or downloaded model weights are needed.
++"""
++import copy
++import socket
++from datetime import timedelta
++import torch
++from torch import nn
++import torch.distributed as dist
++import torch.multiprocessing as mp
++from model.semseg.dpt import DPT, DPTHead
++from model.semseg.ctsa import CTSA
++from util.training_runtime import update_ema
++
++
++class TinyBackbone(nn.Module):
++    def __init__(self):
++        super().__init__()
++        self.proj = nn.Conv2d(3, 24, 14, 14)
++
++    def get_intermediate_layers(self, x, indices):
++        x = self.proj(x).flatten(2).transpose(1, 2)
++        return tuple(x for _ in indices)
++
++
++def make_model():
++    model = DPT.__new__(DPT)
++    nn.Module.__init__(model)
++    model.encoder_size = 'small'
++    model.intermediate_layer_idx = {'small': [2, 5, 8, 11]}
++    model.backbone = TinyBackbone()
++    model.head = DPTHead(3, 24, features=8, out_channels=[8]*4)
++    model.ctsa = CTSA(24, dim=16, heads=4, gate_statistics=True)
++    return model
++
++
++def worker(rank, port):
++    torch.set_num_threads(1)
++    torch.manual_seed(12 + rank)
++    store = dist.TCPStore('127.0.0.1', port, 2, rank == 0,
++                          timeout=timedelta(seconds=45), use_libuv=False)
++    dist.init_process_group('gloo', store=store, rank=rank, world_size=2,
++                            timeout=timedelta(seconds=45))
++    try:
++        model = nn.parallel.DistributedDataParallel(make_model(), find_unused_parameters=True)
++        teacher = copy.deepcopy(model.module); teacher.ctsa = None
++        teacher.eval().requires_grad_(False)
++        optimizer = torch.optim.AdamW(model.parameters(), lr=.001)
++        for step in range(3):
++            x = torch.randn(3,3,28,28)
++            optimizer.zero_grad(set_to_none=True)
++            if step == 0:
++                loss = model(x).square().mean()  # globally skipped CTSA warmup
++            else:
++                with torch.no_grad():
++                    _, features = teacher(x[1:], return_last_feature=True)
++                gate = torch.ones(2,4,1) if rank == 0 else torch.zeros(2,4,1)
++                ordinary, aux = model(x, teacher_feature=features, ctsa_gate=gate, num_labeled=1)
++                active = (gate.sum((1,2)) > 0).float()
++                loss = ordinary.square().mean() + (aux.square().mean((1,2,3))*active).mean()
++            loss.backward()
++            optimizer.step()
++            update_ema(model,teacher,.9)
++            assert torch.isfinite(loss)
++        value=model.module.ctsa.q.weight.detach()
++        peers=[torch.empty_like(value) for _ in range(2)]
++        dist.all_gather(peers,value)
++        torch.testing.assert_close(peers[0],peers[1],rtol=0,atol=0)
++        if rank==0:
++            print('PASS: two-rank warmup, CTSA backward, zero-gate rank, EMA, synchronized weights')
++    finally:
++        dist.destroy_process_group()
++
++
++if __name__ == '__main__':
++    with socket.socket() as listener:
++        listener.bind(('127.0.0.1',0))
++        port=listener.getsockname()[1]
++    mp.spawn(worker,args=(port,),nprocs=2,join=True)
+--- a/configs/loveda.yaml
++++ b/configs/loveda.yaml
+@@ -49,4 +49,32 @@
+ # Print per-iteration CEE-VLM diagnostic counters (edge/low-conf/target pixels).
+ cee_debug: false
+ # Skip VLM refinement when target pixels below this count (0 = always run).
+-min_edge_pixels: 0+min_edge_pixels: 0
++
++# Training-only CTSA; keep every existing CEE option above unchanged.
++use_ctsa: true
++ctsa_dim: 128
++ctsa_heads: 4
++ctsa_alpha: 0.1
++ctsa_temperature: 0.1
++ctsa_weight: 0.1
++ctsa_warmup_ratio: 0.1
++ctsa_ramp_ratio: 0.1
++# none = basic CTSA; confidence = confidence gate; agreement = purified-label gate.
++ctsa_gate: agreement
++ctsa_gate_statistics: false
++ctsa_reject_corrected: true
++
++# Runtime optimizations (no changes to CEE thresholds, sampling or fusion).
++amp: true
++amp_dtype: auto
++teacher_amp: false
++eval_amp: false
++num_workers: 4
++val_num_workers: 2
++persistent_workers: true
++prefetch_factor: 2
++log_interval: 50
++profile_steps: 5
++qwen_batch_size: 2
++qwen_attention: sdpa
+--- a/configs/potsdam.yaml
++++ b/configs/potsdam.yaml
+@@ -48,4 +48,32 @@
+ # Print per-iteration CEE-VLM diagnostic counters (edge/low-conf/target pixels).
+ cee_debug: false
+ # Skip VLM refinement when target pixels below this count (0 = always run).
+-min_edge_pixels: 0+min_edge_pixels: 0
++
++# Training-only CTSA; keep every existing CEE option above unchanged.
++use_ctsa: true
++ctsa_dim: 128
++ctsa_heads: 4
++ctsa_alpha: 0.1
++ctsa_temperature: 0.1
++ctsa_weight: 0.1
++ctsa_warmup_ratio: 0.1
++ctsa_ramp_ratio: 0.1
++# none = basic CTSA; confidence = confidence gate; agreement = purified-label gate.
++ctsa_gate: agreement
++ctsa_gate_statistics: false
++ctsa_reject_corrected: true
++
++# Runtime optimizations (no changes to CEE thresholds, sampling or fusion).
++amp: true
++amp_dtype: auto
++teacher_amp: false
++eval_amp: false
++num_workers: 4
++val_num_workers: 2
++persistent_workers: true
++prefetch_factor: 2
++log_interval: 50
++profile_steps: 5
++qwen_batch_size: 2
++qwen_attention: sdpa
+--- a/scripts/train_ctsa.sh
++++ b/scripts/train_ctsa.sh
+@@ -0,0 +1,18 @@
++#!/usr/bin/env bash
++set -euo pipefail
++# bash scripts/train_ctsa.sh loveda 5_100 1 29501 [optional CEE best.pth]
++dataset=${1:-loveda}
++split=${2:-5_100}
++gpus=${3:-1}
++port=${4:-29501}
++save_path="exp/${dataset}/semiearth_cee_ctsa/dinov2_small/${split}"
++mkdir -p "$save_path"
++extra=()
++if [[ -n "${5:-}" ]]; then
++    extra+=(--init-checkpoint "$5")
++fi
++torchrun --nnodes=1 --nproc_per_node="$gpus" --master_addr=127.0.0.1 --master_port="$port" \
++    semiearth.py --config "configs/${dataset}.yaml" \
++    --labeled-id-path "splits/${dataset}/${split}/labeled.txt" \
++    --unlabeled-id-path "splits/${dataset}/${split}/unlabeled.txt" \
++    --save-path "$save_path" --port "$port" "${extra[@]}" 2>&1 | tee -a "$save_path/out.log"
+--- a/CTSA_README.md
++++ b/CTSA_README.md
+@@ -0,0 +1,124 @@
++# SemiEarth + CEE + CTSA：修改说明与运行方式
++
++## 1. 保留了什么
++
++`util/cee.py`、`model/semseg/vlm_pp.py`、`test_cee.py` 保持原文件不变。已有 CEE 配置值全部保留，包括 LoveDA 的 `edge_conf_thresh: 0.75`、Potsdam 的 `0.85`、边缘宽度、VLM 边缘权重、目标像素选择和置信度融合。
++
++CTSA 的辅助损失直接使用训练入口已有的 CEE `conf_mask`，没有用统一的 0.95 阈值重新过滤边缘。CTSA 门控仅控制教师特征注入，不修改 CEE 或净化标签。新增的 Qwen 批量包装最终仍调用原 `get_qwen_purify` 执行 CEE/SAM/标签融合。
++
++## 2. CTSA 的实际接法
++
++- 取 DINOv2 最后一组 patch tokens，学生为 Q，停止梯度的教师为 K/V。
++- 每个样本独立计算通道交叉注意力，投影维度 128、4 个头，残差系数 0.1；这是方案中的工程适配形式。
++- 共享学生编码器及 DPT 前三组特征的投影，只增加末层重构和辅助解码。
++- 教师在一次已有前向中同时返回 logits 和末层特征，不重新跑编码器。
++- 原学生预测分支始终存在，测试只执行这一分支。教师不包含 CTSA，EMA 按参数名称更新编码器和解码器，避免新增参数导致错位。
++- CutMix 使用原来的 `flip(0)` 配对，同时对教师特征和原始教师标签作对齐。跨越 CutMix 接缝的 patch 关闭注入；ViT 编码后再混合特征仍是上下文近似。
++- 默认 `ctsa_gate: agreement`，依据 CEE 接受掩码、净化置信度及净化前后标签一致性构建门控。包含纠正像素的 patch 保守关闭特征注入，但可信纠正像素仍可参与分割监督。
++
++损失为 `原损失 + ct_weight * 辅助交叉熵`，主损失保持 `(loss_x + loss_u_s) / 2`。辅助损失沿用全部非 ignore 像素归一化。前 10% 训练关闭辅助计算；随后 10% 线性增加至 0.1。预热跳过在所有 rank 上一致，DDP 保留 `find_unused_parameters=True`；启用 CTSA 后，某个 rank 的门控全零也不单独跳过辅助前向。
++
++## 3. 速度优化
++
++| 修改 | 减少的开销 | 说明 |
++|---|---|---|
++| 学生 AMP | 学生前向/反向计算和激活显存 | 自动优先 BF16，不支持时使用 FP16 + GradScaler；教师默认仍 FP32 |
++| DINO 的 PyTorch SDPA | 无 xFormers 时显式构建完整空间注意力矩阵的开销 | 注意力定义不变；CUDA 会选择可用后端 |
++| 移除每步 barrier 和强制 CUDA synchronize | 不必要的等待 | DDP 梯度同步仍然保留；诊断计时除外 |
++| GPU 累积日志统计、降低日志频率 | 多次 `.item()` 和 TensorBoard 写入 | CEE 的统计定义不变 |
++| 只生成实际使用的一份强增强 | PIL 变换、worker 传输、内存 | 数据集默认旧接口仍保留，训练入口明确选择单强增强模式 |
++| 持久化 workers、预取、异步传输 | 每轮启动 worker 和数据搬运 | 可通过配置关闭或调整 |
++| 验证统计在 GPU 累积，结尾一次同步 | 逐图 NumPy 往返及三次 all_reduce | mIoU 类别口径和验证频率保留 |
++| Qwen 批量推理，默认每次 2 张 | 串行生成开销 | 保持 prompt、256 token 上限、图像分辨率和 CEE 目标选择；显存不足时回退串行 |
++| DDP 下 Qwen 绑定当前 rank GPU | 多个进程同时自动跨多张卡分配模型 | 单进程仍保留 auto，可显式配置 `qwen_device_map` |
++
++**CTSA 本身会增加训练计算量，整体提速幅度需要在训练机测量。** 本机没有 CUDA、数据集和 Qwen/SAM 权重，不能给出真实每轮耗时或精度结论。Qwen 批处理、SDPA 和混合精度可能有浮点差异，因此不保证真实生成文本逐 token 完全相同；CEE 算法保持不变。
++
++没有为提速降低 CEE 的调用频率、提高 `min_edge_pixels`、关闭 SAM、缩短训练、降低裁剪尺寸或启用跨图像缓存。这些都会改变实验条件。
++
++## 4. 启动训练
++
++在 Linux 训练机的项目根目录执行。配置中的 `data_root`、LoveDA 的 `qwen_model_name` 仍是你原来的值；迁移机器时请改成对应路径。
++
++```bash
++# 从 DINOv2 预训练权重开始，LoveDA 5%，单卡示例
++bash scripts/train_ctsa.sh loveda 5_100 1 29501
++
++# 4 卡示例
++bash scripts/train_ctsa.sh loveda 5_100 4 29501
++
++# 从已有 CEE 模型初始化；第五个参数是你自己的权重路径
++bash scripts/train_ctsa.sh loveda 5_100 1 29501 /path/to/cee/best.pth
++```
++
++新脚本保存到 `exp/<dataset>/semiearth_cee_ctsa/dinov2_small/<split>`，与原实验目录分开。显卡数应填写实际使用数量；脚本不会自行修改 `CUDA_VISIBLE_DEVICES`。
++
++从 CEE 初始化使用 `--init-checkpoint`，只加载学生/教师权重，CTSA、优化器和训练日程重新开始，必须使用新保存目录。已有 CTSA 实验仍会自动读取同目录 `latest.pth`，恢复优化器、AMP scaler 和 epoch。CTSA 开关与旧检查点不一致时会明确报错，避免误把旧实验当作完整续训。
++
++默认测试接口不变：
++
++```bash
++python test.py --config configs/loveda.yaml --checkpoint exp/loveda/semiearth_cee_ctsa/dinov2_small/5_100/best.pth
++```
++
++测试加载器只排除 `ctsa.*` 参数，编码器/解码器缺失或不匹配仍报错。
++
++## 5. 配置与对照
++
++```yaml
++use_ctsa: true
++ctsa_gate: agreement       # none / confidence / agreement
++ctsa_gate_statistics: false  # true 时也筛选通道相关性统计
++ctsa_weight: 0.1
++ctsa_warmup_ratio: 0.1
++ctsa_ramp_ratio: 0.1
++amp: true
++amp_dtype: auto
++teacher_amp: false
++eval_amp: false
++qwen_batch_size: 2         # 显存不足或要对照串行结果时设 1
++num_workers: 4
++val_num_workers: 2
++profile_steps: 5           # 仅首轮前 5 步详细同步计时；设 0 完全关闭
++```
++
++先比较 `use_ctsa: false` 与 `true`，两组均使用同一套提速设置；再比较 `ctsa_gate: none / confidence / agreement`。仅置信度模式不会剔除被纠正 patch，以免混入一致性规则。所有实验使用不同保存目录。
++
++若要求 FP32 对照，设 `amp: false`；教师/验证默认没有开 AMP。移除无用增强会改变后续随机数流，AMP 也会改变数值轨迹，因此新旧版本不保证相同 seed 的训练轨迹逐步一致。比较精度应保持版本与运行条件一致并重复种子。
++
++## 6. 怎样看真实瓶颈
++
++前几步日志会显示：
++
++- `teacher_ms`：数据传输和教师前向。
++- `vlm_ms`：CEE 统计、Qwen、SAM 和净化调用。
++- `student_forward_ms`：CutMix、CTSA（启用后）、学生前向及损失。
++- `backward_optimizer_ms`：反向传播和优化器。
++- `ema_ms`：统计与 EMA 更新。
++
++每轮另外打印训练总秒数和“学生＋EMA 验证”总秒数。首轮前几步的 CTSA 尚在预热期，不包含辅助解码；训练总时间仍覆盖后续 CTSA 开启阶段。计时并非全程无开销，`profile_steps: 0` 可关闭详细同步计时。
++
++如果 `vlm_ms` 占绝大多数，AMP 对总时间的影响会有限。先确认 `qwen_batch_size: 2` 不发生 OOM，再按显存尝试 4；不要用不同图像共用空间缓存来换速度。
++
++## 7. 验证记录
++
++已在独立 CPU 环境（PyTorch 2.9.0）完成：
++
++- 11 项自动测试：Q/K/V 梯度、教师停止梯度、零门控、跨样本隔离、CutMix 与门控、CEE 接受掩码、指标等价、真实 DINOv2-small+DPT 前后向、EMA/权重加载、权重日程、单强增强输出一致、模拟 Qwen 返回值下的批处理/原 CEE 行为对照。
++- 原 `test_cee.py` 的 CPU 项通过；CUDA 项因本机无 CUDA 跳过。
++- 固定权重下，重构后的普通 DPT 路径与原项目 DPT 输出逐元素一致；SDPA 与手工注意力在浮点容差内一致。
++- 训练入口参数检查及 Python 语法编译通过。
++
++双进程测试脚本 `test_ctsa_ddp.py` 已提供，本地 PyTorch Windows CPU 构建报 `unsupported gloo device`，未能完成分布式运行验证。请在 Linux 训练环境运行：
++
++```bash
++python -m unittest test_ctsa -v
++python test_cee.py
++python test_ctsa_ddp.py
++```
++
++尚未验证：目标 CUDA/NCCL、真实 Qwen/SAM 批推理、完整数据集训练、实际提速比例及精度变化。模拟 Qwen 测试只证明调度及 CEE 后处理一致，不代表真实模型批量生成必定逐 token 相同。
++
++原 VLM 的置信度归一化和显式缓存语义保持原样；此前方案提及的有效净化率问题不在此次 CTSA/性能改动中修正，避免改变 CEE 实验基础。
++
++参考：[PyTorch SDPA](https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html)、[Qwen2.5-VL Transformers 4.57.1 文档](https://huggingface.co/docs/transformers/v4.57.1/en/model_doc/qwen2_5_vl)。

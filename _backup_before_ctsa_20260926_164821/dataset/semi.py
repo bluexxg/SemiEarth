@@ -13,12 +13,11 @@ from torchvision import transforms
 
 
 class SemiDataset(Dataset):
-    def __init__(self, name, root, mode, size=None, id_path=None, nsample=None, single_strong=False):
+    def __init__(self, name, root, mode, size=None, id_path=None, nsample=None):
         self.name = name
         self.root = root
         self.mode = mode
         self.size = size
-        self.single_strong = single_strong
         
         if mode == 'train_l' or mode == 'train_u':
             with open(id_path, 'r') as f:
@@ -50,24 +49,13 @@ class SemiDataset(Dataset):
         if self.mode == 'train_l':
             return normalize(img, mask)
         
-        img_w, img_s1 = deepcopy(img), deepcopy(img)
-        if not self.single_strong:
-            img_s2 = deepcopy(img)
+        img_w, img_s1, img_s2 = deepcopy(img), deepcopy(img), deepcopy(img)
 
         if random.random() < 0.8:
             img_s1 = transforms.ColorJitter(0.5, 0.5, 0.5, 0.25)(img_s1)
         img_s1 = transforms.RandomGrayscale(p=0.2)(img_s1)
         img_s1 = blur(img_s1, p=0.5)
         cutmix_box1 = obtain_cutmix_box(img_s1.size[0], p=0.5)
-
-        if self.single_strong:
-            # This trainer consumes only one strong view. Keep the old default
-            # for other callers, but avoid generating/collating unused tensors.
-            ignore_mask = Image.fromarray(np.zeros((mask.size[1], mask.size[0])))
-            img_s1, ignore_mask = normalize(img_s1, ignore_mask)
-            mask = torch.from_numpy(np.array(mask)).long()
-            ignore_mask[mask == 254] = 255
-            return normalize(img_w), img_s1, ignore_mask, cutmix_box1
 
         if random.random() < 0.8:
             img_s2 = transforms.ColorJitter(0.5, 0.5, 0.5, 0.25)(img_s2)

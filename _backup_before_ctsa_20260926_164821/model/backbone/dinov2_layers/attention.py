@@ -12,7 +12,6 @@ import logging
 
 from torch import Tensor
 from torch import nn
-from torch.nn import functional as F
 
 
 logger = logging.getLogger("dinov2")
@@ -51,12 +50,13 @@ class Attention(nn.Module):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
 
-        q, k, v = qkv.unbind(0)
-        # PyTorch dispatches to an efficient CUDA kernel when supported;
-        # the CPU/math backend remains available. Same attention definition.
-        x = F.scaled_dot_product_attention(
-            q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)
-        x = x.transpose(1, 2).reshape(B, N, C)
+        q, k, v = qkv[0] * self.scale, qkv[1], qkv[2]
+        attn = q @ k.transpose(-2, -1)
+
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x

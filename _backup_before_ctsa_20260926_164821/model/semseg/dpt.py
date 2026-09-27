@@ -5,7 +5,6 @@ import torch.nn.functional as F
 
 from model.backbone.dinov2 import DINOv2
 from model.util.blocks import FeatureFusionBlock, _make_scratch
-from model.semseg.ctsa import CTSA
 
 
 def _make_fusion_block(features, use_bn, size=None):
@@ -83,13 +82,23 @@ class DPTHead(nn.Module):
             nn.Conv2d(features, nclass, kernel_size=1, stride=1, padding=0)
         )
     
-    def project(self, x, i, patch_h, patch_w):
-        x = x.permute(0, 2, 1).reshape(x.shape[0], x.shape[-1], patch_h, patch_w)
-        x = self.resize_layers[i](self.projects[i](x))
-        return getattr(self.scratch, 'layer%d_rn' % (i + 1))(x)
-
-    def decode(self, projected):
-        layer_1_rn, layer_2_rn, layer_3_rn, layer_4_rn = projected
+    def forward(self, out_features, patch_h, patch_w):
+        out = []
+        for i, x in enumerate(out_features):
+            x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], patch_h, patch_w))
+            
+            x = self.projects[i](x)
+            x = self.resize_layers[i](x)
+            
+            out.append(x)
+        
+        layer_1, layer_2, layer_3, layer_4 = out
+        
+        layer_1_rn = self.scratch.layer1_rn(layer_1)
+        layer_2_rn = self.scratch.layer2_rn(layer_2)
+        layer_3_rn = self.scratch.layer3_rn(layer_3)
+        layer_4_rn = self.scratch.layer4_rn(layer_4)
+        
         path_4 = self.scratch.refinenet4(layer_4_rn, size=layer_3_rn.shape[2:])        
         path_3 = self.scratch.refinenet3(path_4, layer_3_rn, size=layer_2_rn.shape[2:])
         path_2 = self.scratch.refinenet2(path_3, layer_2_rn, size=layer_1_rn.shape[2:])
@@ -98,16 +107,6 @@ class DPTHead(nn.Module):
         out = self.scratch.output_conv(path_1)
         
         return out
-
-    def forward(self, out_features, patch_h, patch_w, aux_last=None, num_labeled=0):
-        projected = [self.project(x, i, patch_h, patch_w) for i, x in enumerate(out_features)]
-        out = self.decode(projected)
-        if aux_last is None:
-            return out
-        # Reuse the first three projected student features as well as the encoder.
-        auxiliary = [x[num_labeled:] for x in projected[:3]]
-        auxiliary.append(self.project(aux_last, 3, patch_h, patch_w))
-        return out, self.decode(auxiliary)
 
 
 class DPT(nn.Module):
@@ -118,7 +117,6 @@ class DPT(nn.Module):
         features=128, 
         out_channels=[96, 192, 384, 768], 
         use_bn=False,
-        ctsa_config=None,
     ):
         super(DPT, self).__init__()
         
@@ -135,27 +133,17 @@ class DPT(nn.Module):
         self.head = DPTHead(nclass, self.backbone.embed_dim, features, use_bn, out_channels=out_channels)
         
         self.binomial = torch.distributions.binomial.Binomial(probs=0.5)
-        self.ctsa = None
-        if ctsa_config and ctsa_config.get('use_ctsa', False):
-            self.ctsa = CTSA(
-                self.backbone.embed_dim, dim=ctsa_config.get('ctsa_dim', 128),
-                heads=ctsa_config.get('ctsa_heads', 4),
-                alpha=ctsa_config.get('ctsa_alpha', 0.1),
-                temperature=ctsa_config.get('ctsa_temperature', 0.1),
-                gate_statistics=ctsa_config.get('ctsa_gate_statistics', False))
         
     def lock_backbone(self):
         for p in self.backbone.parameters():
             p.requires_grad = False
     
-    def forward(self, x, comp_drop=False, return_last_feature=False,
-                teacher_feature=None, ctsa_gate=None, num_labeled=0):
+    def forward(self, x, comp_drop=False):
         patch_h, patch_w = x.shape[-2] // 14, x.shape[-1] // 14
         
         features = self.backbone.get_intermediate_layers(
             x, self.intermediate_layer_idx[self.encoder_size]
         )
-        features = tuple(features)
         
         if comp_drop:
             bs, dim = features[0].shape[0], features[0].shape[-1]
@@ -170,21 +158,15 @@ class DPT(nn.Module):
             
             dropout_mask = torch.cat((dropout_mask1, dropout_mask2))
             
-            features = tuple(feature * dropout_mask.unsqueeze(1) for feature in features)
-
-        if teacher_feature is not None:
-            if self.ctsa is None:
-                raise ValueError('teacher_feature requires use_ctsa=True')
-            if return_last_feature:
-                raise ValueError('Auxiliary and teacher feature outputs are separate modes')
-            aux_last = self.ctsa(features[-1][num_labeled:], teacher_feature, ctsa_gate)
-            out, aux = self.head(features, patch_h, patch_w, aux_last, num_labeled)
-            size = (patch_h * 14, patch_w * 14)
-            return (F.interpolate(out, size, mode='bilinear', align_corners=True),
-                    F.interpolate(aux, size, mode='bilinear', align_corners=True))
-
+            features = (feature * dropout_mask.unsqueeze(1) for feature in features)
+            
+            out = self.head(features, patch_h, patch_w)
+            
+            out = F.interpolate(out, (patch_h * 14, patch_w * 14), mode='bilinear', align_corners=True)
+            
+            return out
+        
         out = self.head(features, patch_h, patch_w)
         out = F.interpolate(out, (patch_h * 14, patch_w * 14), mode='bilinear', align_corners=True)
-        if return_last_feature:
-            return out, features[-1]
+        
         return out

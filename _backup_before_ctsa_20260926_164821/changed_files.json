@@ -1,0 +1,18 @@
+[
+  "semiearth.py",
+  "evaluation.py",
+  "test.py",
+  "model/semseg/dpt.py",
+  "model/semseg/ctsa.py",
+  "model/semseg/vlm_runtime.py",
+  "model/backbone/dinov2_layers/attention.py",
+  "dataset/semi.py",
+  "util/ctsa.py",
+  "util/training_runtime.py",
+  "test_ctsa.py",
+  "test_ctsa_ddp.py",
+  "configs/loveda.yaml",
+  "configs/potsdam.yaml",
+  "scripts/train_ctsa.sh",
+  "CTSA_README.md"
+]
