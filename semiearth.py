@@ -35,6 +35,9 @@ parser.add_argument('--local_rank', '--local-rank', default=0, type=int)
 parser.add_argument('--port', default=None, type=int)
 parser.add_argument('--init-checkpoint', default=None, help='Initialize weights only; use a NEW save directory')
 
+from util.benchmark_runtime import add_arguments as add_benchmark_arguments
+add_benchmark_arguments(parser)
+
 def get_vlm_purify(cfg, model, model_ema):
     vlm_type = cfg.get('vlm_type')
     class_names = CLASSES[cfg['dataset']]
@@ -53,6 +56,9 @@ def main():
 
     cfg = yaml.load(open(args.config, "r"), Loader=yaml.Loader)
 
+    from util.benchmark_runtime import prepare as prepare_benchmark, Benchmark
+    prepare_benchmark(args, cfg)
+
     # ---- CEE Edge-aware Module config (all have safe defaults) -----------
     use_cee = cfg.get('use_cee', False)
     use_edge_threshold = cfg.get('use_edge_threshold', True)
@@ -67,6 +73,9 @@ def main():
     logger.propagate = 0
 
     rank, world_size = setup_distributed(port=args.port)
+
+    if args.benchmark and world_size != 1:
+        raise ValueError('Short benchmark supports exactly one GPU/process.')
 
     if rank == 0:
         all_args = {**cfg, **vars(args), 'ngpus': world_size}
@@ -94,8 +103,9 @@ def main():
     model = DPT(**{**model_configs[cfg['backbone'].split('_')[-1]],
                    'nclass': cfg['nclass'], 'ctsa_config': cfg})
 
-    state_dict = torch.load(f'./pretrained/{cfg["backbone"]}.pth', map_location='cpu', weights_only=True)
-    model.backbone.load_state_dict(state_dict)
+    if not args.benchmark:  # Benchmark restores the complete student and EMA checkpoint below.
+        state_dict = torch.load(f'./pretrained/{cfg["backbone"]}.pth', map_location='cpu', weights_only=True)
+        model.backbone.load_state_dict(state_dict)
 
     if cfg['lock_backbone']:
         model.lock_backbone()
@@ -183,7 +193,8 @@ def main():
     best_epoch, best_epoch_ema = 0, 0
     epoch = -1
 
-    latest_path = os.path.join(args.save_path, 'latest.pth')
+    latest_path = (args.benchmark_checkpoint if args.benchmark else
+                   os.path.join(args.save_path, 'latest.pth'))
     if args.init_checkpoint and os.path.exists(latest_path):
         raise ValueError('--init-checkpoint requires a new save directory')
     if args.init_checkpoint:
@@ -212,9 +223,20 @@ def main():
         if rank == 0:
             logger.info('************ Load from checkpoint at epoch %i\n' % epoch)
 
+    if args.benchmark:
+        if not use_ctsa or epoch + 1 >= cfg['epochs']:
+            raise ValueError('Need an in-progress CTSA checkpoint with at least one epoch remaining.')
+        if ctsa_weight((epoch + 1) * len(trainloader_u), total_iters, cfg) <= 0:
+            raise ValueError('Checkpoint is still in CTSA warmup. Supply a later checkpoint; do not shorten epochs.')
+        if args.benchmark_steps + args.benchmark_warmup > len(trainloader_u):
+            raise ValueError('Requested benchmark is longer than one epoch.')
+
     vlm_purify = None
     if cfg.get('use_vlm_pp', True):
         vlm_purify = get_vlm_purify(cfg, model, model_ema)
+
+    benchmark = (Benchmark(args, cfg, vlm_purify, len(trainloader_u), epoch + 1)
+                 if args.benchmark else None)
 
     for epoch in range(epoch + 1, cfg['epochs']):
         if rank == 0:
@@ -244,10 +266,16 @@ def main():
         epoch_start = time.perf_counter()
         log_every = max(1, int(cfg.get('log_interval', max(1, len(trainloader_u) // 8))))
 
+        if benchmark:
+            torch.cuda.synchronize()
+            benchmark.previous_end = time.perf_counter()
+
         for i, ((img_x, mask_x),
                 (img_u_w, img_u_s, ignore_mask, cutmix_box)) in enumerate(loader):
             iters = epoch * len(trainloader_u) + i
-            timer = StepTimer(i < int(cfg.get('profile_steps', 0)) and epoch == 0)
+            if benchmark:
+                benchmark.start_step(i)
+            timer = benchmark or StepTimer(i < int(cfg.get('profile_steps', 0)) and epoch == 0)
             ct_weight = ctsa_weight(iters, total_iters, cfg) if use_ctsa else 0.0
             # Same decision on every rank. During warmup skip the entire auxiliary
             # path (DDP find_unused_parameters=True); no rank-specific skipping.
@@ -270,6 +298,9 @@ def main():
                 # CEE: multi-class semantic edge map from teacher pseudo labels.
                 # Pure tensor op, zero params, inside no_grad -> negligible cost.
                 edge_map = extract_multi_class_edge(mask_u_w, edge_width=edge_width) if use_cee else None
+
+                if benchmark:
+                    timer.mark('cee_edge_ms')
 
                 # ---- CEE statistics: computed on the ORIGINAL teacher conf
                 # (before VLM overwrites conf_u_w) so the logged masks are
@@ -294,6 +325,10 @@ def main():
                 else:
                     vlm_target_pixels = 0
 
+                if benchmark:
+                    timer.mark('cee_statistics_ms')
+                    benchmark.capture_inputs(img_u_w, mask_u_w, conf_u_w, edge_map, ignore_mask)
+
                 if vlm_purify is not None:
                     vlm_type = cfg.get('vlm_type')
                     if vlm_type in ['qwen_vl']:
@@ -306,6 +341,8 @@ def main():
                         else:
                             conf_u_w = vlm_purify.get_qwen_purify(
                                 img_u_w, mask_u_w, conf_u_w, edge_map=edge_map)
+                if benchmark:
+                    benchmark.capture_outputs(conf_u_w, mask_u_w)
             timer.mark('vlm_ms')
             img_u_s = cutmix_tensor(img_u_s, cutmix_box)
 
@@ -443,6 +480,11 @@ def main():
                     _low_conf_mask, _vlm_target_mask,
                     refined_labels=mask_u_w, nclass=cfg['nclass'],
                 )
+
+            if benchmark and benchmark.end_step(ct_weight):
+                writer.close()
+                torch.distributed.destroy_process_group()
+                return  # Never validate or save weights in benchmark mode.
 
         if rank == 0:
             logger.info('[Timing] training epoch seconds: %.1f', time.perf_counter() - epoch_start)

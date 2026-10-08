@@ -6,7 +6,7 @@ data_root: datasets/LoveDA
 
 # arguments for training
 epochs: 20
-batch_size: 4 # per GPU x 4 GPUs
+batch_size: 4 # per GPU
 lr: 0.000005
 lr_multi: 40.0
 criterion:
@@ -23,7 +23,7 @@ lock_backbone: False
 use_vlm_pp: true
 vlm_type: qwen_vl
 vlm_pp_conf_threshold: 0.7
-qwen_model_name: /home/a8/qhf/SemiEarth-master04/SemiEarth-master/pretrained/qwen2_5_vl_3b_instruct
+qwen_model_name: pretrained/qwen2_5_vl_3b_instruct
 use_vlm_on_mismatch: true
 
 # ==========================
@@ -76,5 +76,5 @@ persistent_workers: true
 prefetch_factor: 2
 log_interval: 50
 profile_steps: 5
-qwen_batch_size: 2
+qwen_batch_size: 4
 qwen_attention: sdpa

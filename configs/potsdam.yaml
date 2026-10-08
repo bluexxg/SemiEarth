@@ -6,7 +6,7 @@ data_root: Potsdam
 
 # arguments for training
 epochs: 50
-batch_size: 4 # per GPU x 4 GPUs
+batch_size: 4 # per GPU
 lr: 0.000005
 lr_multi: 40.0
 criterion:
@@ -75,5 +75,7 @@ persistent_workers: true
 prefetch_factor: 2
 log_interval: 50
 profile_steps: 5
-qwen_batch_size: 2
+qwen_batch_size: 4
 qwen_attention: sdpa
+
+qwen_model_name: pretrained/qwen2_5_vl_3b_instruct

@@ -150,17 +150,8 @@ class QwenVLPurifiedSemi:
         )[0]
 
     def _parse_output(self, output_text):
-        valid_detections = {}  # {class_name: [(x1,y1,x2,y2), ...]}
-        output_lower = output_text.lower()
-
-        for class_name in self.class_names:
-            if class_name.lower() in output_lower:
-                pattern = rf"{re.escape(class_name)}[:\s]*\[(\d+),\s*(\d+),\s*(\d+),\s*(\d+)\]"
-                matches = re.findall(pattern, output_text, re.IGNORECASE)
-                if matches:
-                    valid_detections[class_name] = [tuple(map(int, m)) for m in matches]
-
-        return valid_detections
+        from util.grounding_parser import parse_grounding
+        return parse_grounding(output_text, self.class_names)
 
     def _grounding_inference(self, pil_image, feat_H, feat_W):
         img_W, img_H = pil_image.size
@@ -243,6 +234,10 @@ class QwenVLPurifiedSemi:
         B, _, H, W = images.shape
         device = images.device
 
+        trace = getattr(self, '_benchmark_trace', None)
+        if trace:
+            trace.begin_region('cee_parent_selection')
+
         self.current_iter += 1
 
         low_conf_mask = conf_scores < self.vlm_pp_conf_threshold
@@ -265,6 +260,8 @@ class QwenVLPurifiedSemi:
                 print('[CEE-VLM DEBUG] edge_pixels={}, low_conf_pixels={}, '
                       'vlm_target_pixels={}'.format(n_edge, n_low, n_target))
             if n_target < self.min_edge_pixels:
+                if trace:
+                    trace.end_region('cee_parent_selection')
                 if self.cee_debug and _is_rank0():
                     print('[CEE-VLM] Skip VLM: target pixels {} < min_edge_pixels {}'.format(
                         n_target, self.min_edge_pixels))
@@ -275,6 +272,8 @@ class QwenVLPurifiedSemi:
             priority_mask = low_conf_mask
 
         if not priority_mask.any():
+            if trace:
+                trace.end_region('cee_parent_selection')
             if self.cee_debug and _is_rank0():
                 print('[CEE-VLM] Skip VLM inference: no low-confidence edge pixels')
             if self.use_vlm_on_mismatch:
@@ -284,6 +283,8 @@ class QwenVLPurifiedSemi:
         # Cache is only reused when explicitly enabled (baseline mode). Under
         # CEE-guided mode it is disabled by default because priority_mask and
         # pseudo labels change every iteration.
+        if trace:
+            trace.end_region('cee_parent_selection')
         should_infer = (self.current_iter % self.inference_interval == 0)
         if (not self.use_vlm_cache) or should_infer or self.cached_spatial_probs is None:
             all_spatial_probs = []
@@ -301,6 +302,8 @@ class QwenVLPurifiedSemi:
             self.cached_spatial_probs = torch.stack(all_spatial_probs, dim=0).to(device)
             self.cached_shape = (B, H, W)
 
+        if trace:
+            trace.begin_region('cee_label_confidence_fusion')
         qwen_spatial = self.cached_spatial_probs
         # safety: never reuse a cache with inconsistent batch / spatial shape
         if self.cached_shape != (B, H, W) or qwen_spatial.shape[0] != B:
@@ -351,6 +354,8 @@ class QwenVLPurifiedSemi:
                 qwen_weight * qwen_confidence[consistent_mask]
             )
 
+        if trace:
+            trace.end_region('cee_label_confidence_fusion')
         if self.use_vlm_on_mismatch:
             return refined_conf, refined_labels
         return refined_conf
